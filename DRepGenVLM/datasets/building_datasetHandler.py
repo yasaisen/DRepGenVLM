@@ -15,8 +15,7 @@ from typing import Optional, List
 import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, RandomSampler, SequentialSampler
 
-# from .classLevelVisualAttrsDataset import classLevelVisualAttrsDataset
-from .classLevelDynamicMPPDataset import classLevelDynamicMPPDataset
+from .multiROI2DxResultDataset import multiROI2DxResultDataset
 from .maxROI_sampler import MaxROIBatchSampler
 from ..common.utils import log_print
 
@@ -194,12 +193,12 @@ class datasetHandler:
         cfg,
         train_shuffle: bool = True,
     ):
-        valid_dataset = classLevelDynamicMPPDataset.from_config(
+        valid_dataset = multiROI2DxResultDataset.from_config(
             cfg=cfg,
             split='valid',
         ) if cfg.valid_metadata_path else None
 
-        train_dataset = classLevelDynamicMPPDataset.from_config(
+        train_dataset = multiROI2DxResultDataset.from_config(
             cfg=cfg,
             split='train'
         ) if cfg.train_metadata_path else None
