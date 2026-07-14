@@ -12,7 +12,7 @@ import argparse
 import os
 
 
-from .CLEE_baseConfig import CLEE_baseConfig
+from .DRGVLM_baseConfig import DRGVLM_baseConfig
 from ..common.utils import log_print
 
 
@@ -90,8 +90,8 @@ class ConfigHandler:
             cfg_path = os.path.join(checkpoint_path, "config.json")
             log_print(f"Inferring cfg_path from checkpoint_path: {cfg_path}")
 
-        cfg = CLEE_baseConfig.load(
-            path=cfg_path, 
+        cfg = DRGVLM_baseConfig.load(
+            path=cfg_path,
         )
         cfg.trainer_mode = trainer_mode
 

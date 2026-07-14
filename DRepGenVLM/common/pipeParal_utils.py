@@ -13,7 +13,7 @@ import os
 import torch
 from transformers import AutoConfig
 
-from ..configs.CLEE_baseConfig import CLEE_baseConfig
+from ..configs.DRGVLM_baseConfig import DRGVLM_baseConfig
 from ..common.utils import log_print, _debug_print
 
 

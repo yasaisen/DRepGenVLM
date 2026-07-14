@@ -13,11 +13,11 @@ import os
 import torch
 import torch.distributed as dist
 
-from ..configs.CLEE_baseConfig import CLEE_baseConfig
+from ..configs.DRGVLM_baseConfig import DRGVLM_baseConfig
 
 
 def init_distributed_mode(
-    cfg: CLEE_baseConfig,
+    cfg: DRGVLM_baseConfig,
 ):
     if cfg.distributed is False:
         print("Not using distributed mode")
