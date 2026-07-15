@@ -46,6 +46,7 @@ class DownstreamRepGenVLM(nn.Module):
         self.device = torch.device(device)
         self.use_text_gradient_checkpointing = False
         self.use_shared_vision_cache = True  # controlled by from_config via cfg.use_shared_vision_cache
+        self.use_vision_lora = False
 
     # ------------------------------------------------------------------
     # train() override – keep VLM backbone in eval when not checkpointing
@@ -131,6 +132,7 @@ class DownstreamRepGenVLM(nn.Module):
         lora_alpha: int,
         lora_dropout: float,
         lora_target_modules: List[str],
+        use_vision_lora: bool = False,
     ):
         """Wrap the VLM with PEFT LoRA; only LoRA params become trainable."""
         try:
@@ -138,12 +140,18 @@ class DownstreamRepGenVLM(nn.Module):
         except ImportError:
             raise ImportError("peft is required for LoRA. Install via: pip install peft")
 
+        self.use_vision_lora = bool(use_vision_lora)
+        # PEFT target-module lists match suffixes (for example q_proj), which
+        # otherwise injects adapters into both Gemma's text decoder and vision
+        # tower.  Keep those scopes independent from the vision-cache setting.
+        vision_exclude_pattern = r"(?:.*\.)?vision_tower(?:\..*)?"
         lora_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=int(lora_r),
             lora_alpha=int(lora_alpha),
             lora_dropout=float(lora_dropout),
             target_modules=list(lora_target_modules),
+            exclude_modules=None if self.use_vision_lora else vision_exclude_pattern,
             bias="none",
             inference_mode=False,
         )
@@ -151,6 +159,43 @@ class DownstreamRepGenVLM(nn.Module):
         vlm_model = getattr(self, "vlm_model")
         peft_model = get_peft_model(vlm_model, lora_config)
         peft_model.print_trainable_parameters()
+
+        trainable_names = []
+        total_lora_params = 0
+        vision_lora_params = 0
+        for name, param in peft_model.named_parameters():
+            if not param.requires_grad:
+                continue
+            trainable_names.append(name)
+            param_count = int(param.numel())
+            total_lora_params += param_count
+            if "vision_tower" in name:
+                vision_lora_params += param_count
+
+        if total_lora_params == 0:
+            raise RuntimeError(
+                "LoRA injection produced no trainable parameters. "
+                f"Check target_modules={lora_target_modules}."
+            )
+        if not self.use_vision_lora and vision_lora_params != 0:
+            offending = [name for name in trainable_names if "vision_tower" in name]
+            raise RuntimeError(
+                "use_vision_lora=False, but trainable vision-tower adapters were found: "
+                + ", ".join(offending[:8])
+            )
+        if self.use_vision_lora and vision_lora_params == 0:
+            raise RuntimeError(
+                "use_vision_lora=True, but no trainable vision-tower LoRA parameters "
+                "were created. Check the configured target modules and model topology."
+            )
+
+        text_lora_params = total_lora_params - vision_lora_params
+        log_print(
+            "LoRA scope verified: "
+            f"text_trainable={text_lora_params:,}, "
+            f"vision_trainable={vision_lora_params:,}, "
+            f"total_trainable={total_lora_params:,}"
+        )
 
         # Replace raw vlm_model with the peft-wrapped version.
         # Use normal nn.Module attribute assignment so that vlm_model is registered
@@ -170,7 +215,8 @@ class DownstreamRepGenVLM(nn.Module):
 
         log_print(
             f"LoRA applied: r={lora_r}, alpha={lora_alpha}, "
-            f"dropout={lora_dropout}, targets={lora_target_modules}"
+            f"dropout={lora_dropout}, targets={lora_target_modules}, "
+            f"use_vision_lora={self.use_vision_lora}"
         )
 
     # ------------------------------------------------------------------
@@ -227,7 +273,11 @@ class DownstreamRepGenVLM(nn.Module):
             if roi.mpp is not None:
                 text += f"MPP: {roi.mpp:.6f}, "
             if roi.cxcywh is not None:
-                text += f"cxcywh: {roi.cxcywh}, "
+                cx, cy, width, height = roi.cxcywh
+                text += (
+                    "cxcywh: "
+                    f"({cx:.6f}, {cy:.6f}, {width:.6f}, {height:.6f}), "
+                )
             text += self.sep_str
             content.append({"type": "text", "text": text})
 
@@ -389,7 +439,13 @@ class DownstreamRepGenVLM(nn.Module):
 
     def _get_vision_prefix_embeds(self,
         case,
-    ) -> Tuple[torch.Tensor, int, int]:
+    ) -> Tuple[
+        torch.Tensor,
+        int,
+        int,
+        torch.Tensor,
+        Optional[torch.Tensor],
+    ]:
         """One no_grad VLM forward to obtain the shared vision prefix embeddings.
 
         Strategy:
@@ -406,6 +462,8 @@ class DownstreamRepGenVLM(nn.Module):
             vision_prefix_embeds    : (1, V, H) – vision part of merged embeddings
             q_start_in_ids          : int – last-sep + 1 in token space (shared across DxItems)
             vision_prefix_len_merged: int – corresponding position in merged space
+            vision_prefix_attn_mask : (1, V) – cached attention-mask prefix
+            vision_prefix_token_type_ids: optional (1, V) Gemma multimodal token types
         """
         ref_DxItem = next(iter(case.DxItem_targets))
         messages = self._build_inference_messages(case=case, DxItem=ref_DxItem)
@@ -445,7 +503,41 @@ class DownstreamRepGenVLM(nn.Module):
             )
 
         vision_prefix_embeds = merged_embeds[:, :vision_prefix_len_merged, :].clone()
-        return vision_prefix_embeds, q_start_in_ids, vision_prefix_len_merged
+
+        ref_attn_mask = ref_inputs.get("attention_mask")
+        if ref_attn_mask is None:
+            ref_attn_mask = torch.ones_like(ref_ids, dtype=torch.long)
+        if ref_attn_mask.shape[1] != merged_embeds.shape[1]:
+            raise RuntimeError(
+                "[VisionCache] attention_mask and merged embeddings have different "
+                f"sequence lengths ({ref_attn_mask.shape[1]} vs "
+                f"{merged_embeds.shape[1]}). Disable use_shared_vision_cache for "
+                "this processor/model combination."
+            )
+        vision_prefix_attn_mask = ref_attn_mask[
+            :, :vision_prefix_len_merged
+        ].to(device=vision_prefix_embeds.device)
+
+        ref_token_type_ids = ref_inputs.get("token_type_ids")
+        vision_prefix_token_type_ids = None
+        if ref_token_type_ids is not None:
+            if ref_token_type_ids.shape[1] != merged_embeds.shape[1]:
+                raise RuntimeError(
+                    "[VisionCache] token_type_ids and merged embeddings have different "
+                    f"sequence lengths ({ref_token_type_ids.shape[1]} vs "
+                    f"{merged_embeds.shape[1]})."
+                )
+            vision_prefix_token_type_ids = ref_token_type_ids[
+                :, :vision_prefix_len_merged
+            ].to(device=vision_prefix_embeds.device)
+
+        return (
+            vision_prefix_embeds,
+            q_start_in_ids,
+            vision_prefix_len_merged,
+            vision_prefix_attn_mask,
+            vision_prefix_token_type_ids,
+        )
 
     def build_train_inputs_with_vision_cache(self,
         case,
@@ -453,8 +545,15 @@ class DownstreamRepGenVLM(nn.Module):
         vision_prefix_embeds: torch.Tensor,
         q_start_in_ids: int,
         vision_prefix_len_merged: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build (inputs_embeds, attention_mask, labels) reusing the cached vision prefix.
+        vision_prefix_attn_mask: torch.Tensor,
+        vision_prefix_token_type_ids: Optional[torch.Tensor],
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+    ]:
+        """Build cached multimodal inputs while preserving Gemma mask semantics.
 
         The cached vision_prefix_embeds (no grad) is concatenated with a text-only
         suffix embedding (question + template + answer tokens).  The suffix is
@@ -466,7 +565,8 @@ class DownstreamRepGenVLM(nn.Module):
 
         Returns:
             combined_embeds : (1, S, H)
-            attn_mask       : (1, S)  – all ones
+            attn_mask       : (1, S)
+            token_type_ids  : optional (1, S) Gemma multimodal token types
             labels          : (1, S)  – -100 on non-answer positions
         """
         images = [roi.image for roi in case.rois if roi.image is not None]
@@ -499,8 +599,59 @@ class DownstreamRepGenVLM(nn.Module):
         combined_embeds = torch.cat([vision_prefix_embeds, suffix_embeds], dim=1)
         S_combined = combined_embeds.shape[1]
 
-        # Attention mask: all tokens attend (no padding)
-        attn_mask = torch.ones(1, S_combined, dtype=torch.long, device=combined_embeds.device)
+        full_attn_mask = full_inputs.get("attention_mask")
+        if full_attn_mask is None:
+            full_attn_mask = torch.ones_like(full_ids, dtype=torch.long)
+        if full_attn_mask.shape[1] != full_ids.shape[1]:
+            raise RuntimeError(
+                "[VisionCache] full attention_mask length does not match input_ids: "
+                f"{full_attn_mask.shape[1]} vs {full_ids.shape[1]}."
+            )
+        suffix_attn_mask = full_attn_mask[:, q_start_in_ids:].to(
+            device=combined_embeds.device
+        )
+        attn_mask = torch.cat(
+            [vision_prefix_attn_mask.to(combined_embeds.device), suffix_attn_mask],
+            dim=1,
+        )
+
+        full_token_type_ids = full_inputs.get("token_type_ids")
+        if (vision_prefix_token_type_ids is None) != (full_token_type_ids is None):
+            raise RuntimeError(
+                "[VisionCache] token_type_ids are present in only one of the "
+                "reference/full prompts; cached forward would not be equivalent."
+            )
+        combined_token_type_ids = None
+        if full_token_type_ids is not None:
+            if full_token_type_ids.shape[1] != full_ids.shape[1]:
+                raise RuntimeError(
+                    "[VisionCache] full token_type_ids length does not match input_ids: "
+                    f"{full_token_type_ids.shape[1]} vs {full_ids.shape[1]}."
+                )
+            suffix_token_type_ids = full_token_type_ids[:, q_start_in_ids:].to(
+                device=combined_embeds.device
+            )
+            combined_token_type_ids = torch.cat(
+                [
+                    vision_prefix_token_type_ids.to(combined_embeds.device),
+                    suffix_token_type_ids,
+                ],
+                dim=1,
+            )
+
+        if attn_mask.shape[1] != S_combined:
+            raise RuntimeError(
+                "[VisionCache] rebuilt attention_mask length does not match "
+                f"combined embeddings: {attn_mask.shape[1]} vs {S_combined}."
+            )
+        if (
+            combined_token_type_ids is not None
+            and combined_token_type_ids.shape[1] != S_combined
+        ):
+            raise RuntimeError(
+                "[VisionCache] rebuilt token_type_ids length does not match "
+                f"combined embeddings: {combined_token_type_ids.shape[1]} vs {S_combined}."
+            )
 
         # Labels:
         #   - vision prefix tokens  → -100
@@ -522,8 +673,9 @@ class DownstreamRepGenVLM(nn.Module):
                 f">= S_combined={S_combined} for case_id={case.case_id}, DxItem={DxItem}. "
                 "No answer tokens found in labels – loss will be zero for this pair."
             )
+        labels[attn_mask == 0] = -100
 
-        return combined_embeds, attn_mask, labels
+        return combined_embeds, attn_mask, combined_token_type_ids, labels
 
     # ------------------------------------------------------------------
     # calculate_loss  (training)
@@ -556,17 +708,23 @@ class DownstreamRepGenVLM(nn.Module):
 
             # ---- Shared vision cache path ----
             if self.use_shared_vision_cache:
-                vision_prefix_embeds, q_start_in_ids, vision_prefix_len_merged = (
-                    self._get_vision_prefix_embeds(case)
-                )
+                (
+                    vision_prefix_embeds,
+                    q_start_in_ids,
+                    vision_prefix_len_merged,
+                    vision_prefix_attn_mask,
+                    vision_prefix_token_type_ids,
+                ) = self._get_vision_prefix_embeds(case)
                 for DxItem in case.DxItem_targets:
-                    combined_embeds, attn_mask, labels = (
+                    combined_embeds, attn_mask, token_type_ids, labels = (
                         self.build_train_inputs_with_vision_cache(
                             case=case,
                             DxItem=DxItem,
                             vision_prefix_embeds=vision_prefix_embeds,
                             q_start_in_ids=q_start_in_ids,
                             vision_prefix_len_merged=vision_prefix_len_merged,
+                            vision_prefix_attn_mask=vision_prefix_attn_mask,
+                            vision_prefix_token_type_ids=vision_prefix_token_type_ids,
                         )
                     )
                     # combined_embeds has no grad_fn (vision prefix and suffix were
@@ -577,10 +735,15 @@ class DownstreamRepGenVLM(nn.Module):
                     # discarded when the local variable goes out of scope.
                     combined_embeds = combined_embeds.requires_grad_(True)
                     vlm = getattr(self, "vlm_model")
+                    forward_kwargs = {
+                        "inputs_embeds": combined_embeds,
+                        "attention_mask": attn_mask,
+                        "use_cache": False,
+                    }
+                    if token_type_ids is not None:
+                        forward_kwargs["token_type_ids"] = token_type_ids
                     outputs = vlm(
-                        inputs_embeds=combined_embeds,
-                        attention_mask=attn_mask,
-                        use_cache=False,
+                        **forward_kwargs,
                     )
                     logits = outputs.logits
                     context = f"case_id={case.case_id}, DxItem={DxItem}"
@@ -678,7 +841,23 @@ class DownstreamRepGenVLM(nn.Module):
 
         vlm = getattr(self, "vlm_model")
         if hasattr(vlm, "load_adapter"):
-            vlm.load_adapter(path, adapter_name="default")
+            load_result = vlm.load_adapter(
+                path,
+                adapter_name="default",
+                is_trainable=True,
+            )
+            missing_keys = list(getattr(load_result, "missing_keys", []) or [])
+            unexpected_keys = list(getattr(load_result, "unexpected_keys", []) or [])
+            if missing_keys or unexpected_keys:
+                raise RuntimeError(
+                    "LoRA checkpoint topology does not match the current model. "
+                    f"missing_keys={missing_keys[:12]}, "
+                    f"unexpected_keys={unexpected_keys[:12]}. "
+                    "This commonly occurs when loading a former vision+text adapter "
+                    "after switching to text-only LoRA."
+                )
+            if hasattr(vlm, "set_adapter"):
+                vlm.set_adapter("default")
             log_print(f"LoRA weights loaded from {path}")
         else:
             raise RuntimeError("vlm_model does not support load_adapter.")
@@ -707,6 +886,17 @@ class DownstreamRepGenVLM(nn.Module):
         log_print(f"Loading Model...", head=True)
         log_print(f"model_name: {cfg.model_name}")
 
+        use_shared_vision_cache = bool(
+            getattr(cfg, "use_shared_vision_cache", True)
+        )
+        use_vision_lora = bool(getattr(cfg, "use_vision_lora", False))
+        if use_shared_vision_cache and use_vision_lora:
+            raise ValueError(
+                "use_shared_vision_cache=True is incompatible with "
+                "use_vision_lora=True. The cached vision prefix is computed under "
+                "torch.no_grad(), so vision adapters would not receive gradients."
+            )
+
         builder = modelBuilder(weight_path=cfg.weight_path)
         vlm_model, vlm_processor, _, _, vlm_max_senLen, _ = builder.create_language_model(
             model_name=cfg.model_name,
@@ -716,7 +906,9 @@ class DownstreamRepGenVLM(nn.Module):
             torch_dtype=torch.bfloat16,
             config_dict={
                 "use_bidirectional_attention": False,  # SFT requires causal (left-to-right) attention
-                "attn_implementation": getattr(cfg, "attn_implementation", "sdpa"),
+                "attn_implementation": (
+                    getattr(cfg, "attn_implementation", "sdpa") or "sdpa"
+                ),
             },
             pp_num_gpus=(
                 getattr(cfg, "pp_num_gpus", None)
@@ -736,14 +928,16 @@ class DownstreamRepGenVLM(nn.Module):
             lora_alpha=cfg.lora_alpha,
             lora_dropout=cfg.lora_dropout,
             lora_target_modules=cfg.lora_target_modules,
+            use_vision_lora=use_vision_lora,
         )
         model.init_sep(
             sep_str=getattr(cfg, "sep_str", "<unused0>"),
             boc_str=getattr(cfg, "boc_str", "<unused1>"),
         )
 
-        model.use_shared_vision_cache = bool(getattr(cfg, "use_shared_vision_cache", True))
+        model.use_shared_vision_cache = use_shared_vision_cache
         log_print(f"use_shared_vision_cache = {model.use_shared_vision_cache}")
+        log_print(f"use_vision_lora = {model.use_vision_lora}")
 
         if load_criterion:
             log_print("Loading Criterion...")
@@ -754,8 +948,6 @@ class DownstreamRepGenVLM(nn.Module):
 
         log_print("...Done\n")
         return model
-
-
 
 
 

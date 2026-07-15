@@ -96,6 +96,7 @@ class DRGVLM_PPTrainer:
 
         self.checkpoint_epoch_idx = None
         self.global_step = 0
+        self.optimizer_step = 0
         self.best_val_loss = float("inf")
         self.best_metric_values: Dict[str, Any] = {}
         self.patience_counter = 0
@@ -270,6 +271,17 @@ class DRGVLM_PPTrainer:
             return {}
         return {k: float(np.mean([d[k] for d in buf])) for k in buf[0]}
 
+    @staticmethod
+    def _accumulation_block_size(
+        batch_idx: int,
+        num_batches: int,
+        accumulation_steps: int,
+    ) -> int:
+        """Return the actual size of the accumulation block containing batch_idx."""
+        accumulation_steps = max(1, int(accumulation_steps))
+        block_start = (int(batch_idx) // accumulation_steps) * accumulation_steps
+        return max(1, min(accumulation_steps, int(num_batches) - block_start))
+
     # ------------------------------------------------------------------
     # Train one batch (gradient accumulation aware)
     # ------------------------------------------------------------------
@@ -316,11 +328,10 @@ class DRGVLM_PPTrainer:
             is_last_batch = (batch_idx + 1 == num_batches)
             is_accum_step = ((batch_idx + 1) % self.accumulation_steps == 0) or is_last_batch
 
-            last_block_size = int(num_batches % self.accumulation_steps)
-            accumulation_denom = (
-                last_block_size
-                if is_last_batch and last_block_size != 0
-                else self.accumulation_steps
+            accumulation_denom = self._accumulation_block_size(
+                batch_idx=batch_idx,
+                num_batches=num_batches,
+                accumulation_steps=self.accumulation_steps,
             )
 
             with nullcontext():
@@ -335,6 +346,7 @@ class DRGVLM_PPTrainer:
             self.global_step += 1
             epoch_losses.append(float(loss_dict["total_loss"]))
 
+            optimizer_step_lr = None
             if is_accum_step:
                 step_context = (
                     f"epoch={epoch_idx}, batch_idx={batch_idx}, "
@@ -351,21 +363,26 @@ class DRGVLM_PPTrainer:
                         self._raise_nonfinite("clip_grad_norm", grad_norm, step_context)
                     self._assert_trainable_grads_finite(context=f"after grad clip, {step_context}")
 
+                optimizer_step_lr = float(self.optimizer.param_groups[0]["lr"])
                 self.optimizer.step()
                 self._assert_trainable_params_finite(context=f"after opt step, {step_context}")
                 self._assert_optimizer_state_finite(context=f"after opt step, {step_context}")
                 self.scheduler.step()
+                self.optimizer_step += 1
                 self.optimizer.zero_grad(set_to_none=True)
 
             current_lr = self.optimizer.param_groups[0]["lr"]
-            if is_accum_step:
-                self.metrics.update(
-                    loss_dict=loss_dict,
-                    lr=current_lr,
-                    stage="train",
-                    rank=0,
-                    global_step=self.global_step,
-                )
+            # Record every DataLoader batch so epoch loss is not biased toward
+            # only the final microbatch in each accumulation block.  LR is
+            # emitted only when an optimizer update actually occurred.
+            self.metrics.update(
+                loss_dict=loss_dict,
+                lr=optimizer_step_lr,
+                stage="train",
+                rank=0,
+                global_step=self.global_step,
+                optimizer_step=self.optimizer_step,
+            )
 
             pbar.set_postfix({
                 "Loss": f"{loss_dict['total_loss']:.4f}",
@@ -511,6 +528,7 @@ class DRGVLM_PPTrainer:
         checkpoint = {
             "epoch_idx": epoch_idx,
             "global_step": int(getattr(self, "global_step", 0)),
+            "optimizer_step": int(getattr(self, "optimizer_step", 0)),
             "best_val_loss": float(getattr(self, "best_val_loss", float("inf"))),
             "best_metric_values": getattr(self, "best_metric_values", {}),
             "patience_counter": int(getattr(self, "patience_counter", 0)),
@@ -552,26 +570,58 @@ class DRGVLM_PPTrainer:
         if os.path.isdir(lora_dir):
             self.get_model_raw().load_lora_weights(path=lora_dir)
         else:
-            log_print(f"[WARN] LoRA directory not found: {lora_dir}; skipping LoRA load.")
-
-        if self.optimizer is not None and checkpoint.get("optimizer_state_dict") is not None:
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        if self.scheduler is not None and checkpoint.get("scheduler_state_dict") is not None:
-            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            raise FileNotFoundError(
+                f"LoRA directory not found for checkpoint: {lora_dir}. "
+                "Refusing to continue with randomly initialized adapters."
+            )
 
         loaded_epoch_idx = int(checkpoint.get("epoch_idx", -1))
         self.checkpoint_epoch_idx = loaded_epoch_idx if self.trainer_mode != "reTrain" else -1
 
         if self.trainer_mode == "reTrain":
+            # Optimizer and scheduler were freshly initialized in from_config;
+            # retain those states and use only the loaded LoRA weights.
             self.global_step = 0
+            self.optimizer_step = 0
             self.best_val_loss = float("inf")
             self.best_metric_values = {}
             self.patience_counter = 0
+            log_print(
+                "reTrain mode: loaded LoRA weights only; optimizer, scheduler, "
+                "epoch, steps, best metrics, and patience were reset."
+            )
         else:
+            if self.optimizer is not None:
+                optimizer_state = checkpoint.get("optimizer_state_dict")
+                if optimizer_state is None:
+                    raise RuntimeError(
+                        "Continuation checkpoint has no optimizer_state_dict. "
+                        "Use --retrain if only LoRA weights should be reused."
+                    )
+                self.optimizer.load_state_dict(optimizer_state)
+            if self.scheduler is not None:
+                scheduler_state = checkpoint.get("scheduler_state_dict")
+                if scheduler_state is None:
+                    raise RuntimeError(
+                        "Continuation checkpoint has no scheduler_state_dict. "
+                        "Use --retrain if the schedule should restart."
+                    )
+                self.scheduler.load_state_dict(scheduler_state)
             self.global_step = int(checkpoint.get("global_step", 0))
+            self.optimizer_step = int(checkpoint.get(
+                "optimizer_step",
+                self.global_step // max(1, self.accumulation_steps),
+            ))
             self.best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
             self.best_metric_values = checkpoint.get("best_metric_values", {}) or {}
             self.patience_counter = int(checkpoint.get("patience_counter", 0))
+            self.resume_num_batches_per_epoch = checkpoint.get(
+                "num_batches_per_epoch", None
+            )
+            log_print(
+                "Continuation mode: restored LoRA, optimizer, scheduler, epoch, "
+                "steps, best metrics, and patience state."
+            )
 
         log_print(f"Checkpoint loaded from {path}; epoch={loaded_epoch_idx}")
         return self.checkpoint_epoch_idx
@@ -599,18 +649,22 @@ class DRGVLM_PPTrainer:
             "macro_exact_match": "best_macro_exact_match.pth",
             "macro_bleu": "best_macro_bleu.pth",
             "macro_token_f1": "best_macro_token_f1.pth",
+            "macro_rouge_l": "best_macro_rouge_l.pth",
         }
         for metric_name, fn in metric_to_filename.items():
             score = self._finite_float(metric_dict.get(metric_name))
             if score is not None:
                 scores[fn] = score
 
-        # Composite: 0.4 exact_match + 0.3 bleu + 0.3 token_f1
-        em = self._finite_float(metric_dict.get("macro_exact_match"))
-        bl = self._finite_float(metric_dict.get("macro_bleu"))
-        f1 = self._finite_float(metric_dict.get("macro_token_f1"))
-        if all(v is not None for v in [em, bl, f1]):
-            scores["best_composite.pth"] = 0.4 * em + 0.3 * bl + 0.3 * f1
+        text_composite = self._finite_float(metric_dict.get("text_composite"))
+        if text_composite is not None:
+            scores["best_text_composite.pth"] = text_composite
+
+        clinical_composite = self._finite_float(
+            metric_dict.get("clinical_macro_score")
+        )
+        if clinical_composite is not None:
+            scores["best_clinical_composite.pth"] = clinical_composite
 
         return scores
 
@@ -704,8 +758,6 @@ class DRGVLM_PPTrainer:
             trainer.load_checkpoint(path=checkpoint_path)
 
         return trainer
-
-
 
 
 

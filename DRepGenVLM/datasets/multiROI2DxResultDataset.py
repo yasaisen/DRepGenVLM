@@ -9,24 +9,33 @@
 """
 
 
-from typing import List, Dict, Tuple, Optional
+from typing import Any, List, Dict, Tuple, Optional
 import os, json, random
-import torch
 from torch.utils.data import Dataset
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from PIL import Image
 import torchvision.transforms.functional as TF
 from torchvision import transforms
 
 
 from ..configs.DRGVLM_baseConfig import DRGVLM_baseConfig
-from ..common.utils import log_print, _debug_print
+from ..common.utils import log_print
 
 
 @dataclass
 class ROI:
     global_idx: int
     image: Optional[Image.Image]
+    mpp: Optional[float]
+    cxcywh: Optional[Tuple[float, float, float, float]]
+    roi_wh: Tuple[float, float]
+
+
+@dataclass(frozen=True)
+class ROIRecord:
+    """Lightweight ROI metadata used for sampling before image I/O."""
+    global_idx: int
+    roi_path: Optional[str]
     mpp: Optional[float]
     cxcywh: Optional[Tuple[float, float, float, float]]
     roi_wh: Tuple[float, float]
@@ -46,11 +55,12 @@ class RandomDiscreteRotation:
 
     def __call__(self, x):
         angle = random.choice(self.angles)
-        return TF.rotate(x, angle)
+        return TF.rotate(x, angle, expand=True)
 
 
 class multiROI2DxResultDataset(Dataset):
     def __init__(self,
+        image_path: str, 
         metadata_path: str,
         split: str,
         input_img: bool = True,
@@ -58,7 +68,9 @@ class multiROI2DxResultDataset(Dataset):
         level_key: str = "main_info",
         max_rois_per_case: Optional[int] = None,
         roi_sampling_mode: str = "all",
+        valid_sampling_seed: int = 42,
     ):
+        self.image_path = image_path
         self.metadata_path = metadata_path
         self.split = split
         self.input_img = input_img
@@ -66,12 +78,21 @@ class multiROI2DxResultDataset(Dataset):
         self.level_key = level_key
         self.max_rois_per_case = int(max_rois_per_case) if max_rois_per_case is not None else None
         self.roi_sampling_mode = roi_sampling_mode
+        self.valid_sampling_seed = int(valid_sampling_seed)
 
         with open(self.metadata_path, "r") as f:
             metadata = json.load(f)
 
         self.DxItem_list = metadata["DxItem_list"]
         self.case_list = metadata["case_list"]
+        self.invalid_reference_records = self._find_invalid_references()
+        for record in self.invalid_reference_records:
+            log_print(
+                "[MetadataValidation][WARN] "
+                f"split={self.split}, case_id={record['case_id']}, "
+                f"DxItem={record['DxItem']}, value={record['value']!r}, "
+                f"reason={record['reason']}"
+            )
 
         if self.split == "train":
             self.transform = transforms.Compose([
@@ -84,6 +105,32 @@ class multiROI2DxResultDataset(Dataset):
 
     def __len__(self):
         return len(self.case_list)
+
+    def _find_invalid_references(self) -> List[Dict[str, Any]]:
+        """Report obviously malformed targets without silently dropping samples."""
+        invalid: List[Dict[str, Any]] = []
+        for sample in self.case_list:
+            dx_items = sample.get("structured_report", {}).get("DxItems", {})
+            for dx_item, dx_sample in dx_items.items():
+                if dx_item not in self.DxItem_list:
+                    continue
+                value = dx_sample.get("DxResultTxt", None)
+                reason = None
+                if not isinstance(value, str) or not value.strip():
+                    reason = "empty or non-string reference"
+                elif dx_item == "Histologic_Type":
+                    compact = "".join(ch for ch in value.strip().lower() if ch.isalpha())
+                    if len(compact) < 3:
+                        reason = "histologic type is too short to be a valid label"
+                if reason is not None:
+                    invalid.append({
+                        "sample_idx": sample.get("sample_idx"),
+                        "case_id": str(sample.get("case_id", "")),
+                        "DxItem": dx_item,
+                        "value": value,
+                        "reason": reason,
+                    })
+        return invalid
 
     def get_raw_roi_count(self,
         idx: int,
@@ -113,8 +160,9 @@ class multiROI2DxResultDataset(Dataset):
         )
 
     def _sample_rois(self,
-        roi_list: List[ROI],
-    ) -> List[ROI]:
+        roi_list: List[Any],
+        rng=None,
+    ) -> List[Any]:
         if self.max_rois_per_case is None or self.max_rois_per_case <= 0:
             return roi_list
         if len(roi_list) <= self.max_rois_per_case:
@@ -122,7 +170,8 @@ class multiROI2DxResultDataset(Dataset):
 
         mode = self.roi_sampling_mode
         if mode == "random_k":
-            indices = sorted(random.sample(range(len(roi_list)), self.max_rois_per_case))
+            rng = random if rng is None else rng
+            indices = sorted(rng.sample(range(len(roi_list)), self.max_rois_per_case))
             return [roi_list[i] for i in indices]
         if mode == "tail_k":
             return roi_list[-self.max_rois_per_case:]
@@ -140,8 +189,8 @@ class multiROI2DxResultDataset(Dataset):
     ) -> Case:
         sample = self.case_list[idx]
 
-        # Collect ROIs from all tissue_blocks × stains that have roi_list
-        roi_list = []
+        # Collect lightweight metadata first so unselected images are never opened.
+        roi_records: List[ROIRecord] = []
         for block in sample["tissue_blocks"]:
             for stain in block["stains"]:
                 if "roi_list" not in stain:
@@ -149,13 +198,6 @@ class multiROI2DxResultDataset(Dataset):
                 for roi_sample in stain["roi_list"]:
                     level_info = roi_sample.get(self.level_key, {})
                     roi_path = level_info.get("roi_path", None)
-
-                    if self.input_img and roi_path is not None:
-                        image = self.transform(
-                            Image.open(roi_path).convert("RGB")
-                        )
-                    else:
-                        image = None
 
                     mpp_raw = level_info.get("mpp", None)
                     if mpp_raw is not None and self.input_loc:
@@ -170,15 +212,35 @@ class multiROI2DxResultDataset(Dataset):
                     cxcywh = tuple(level_info["cxcywh"]) if (self.input_loc and "cxcywh" in level_info and level_info["cxcywh"] is not None) else None
                     roi_wh = tuple(level_info["roi_wh"]) if ("roi_wh" in level_info and level_info["roi_wh"] is not None) else (0.0, 0.0)
 
-                    roi_list.append(ROI(
+                    roi_records.append(ROIRecord(
                         global_idx=roi_sample["global_idx"],
-                        image=image,
+                        roi_path=roi_path,
                         mpp=mpp,
                         cxcywh=cxcywh,
                         roi_wh=roi_wh,
                     ))
 
-        roi_list = self._sample_rois(roi_list)
+        # Validation uses the same sampling method as training, but a stable
+        # per-case RNG keeps the selected subset comparable across epochs.
+        sampling_rng = None
+        if self.split == "valid" and self.roi_sampling_mode == "random_k":
+            sampling_rng = random.Random(self.valid_sampling_seed + int(idx))
+        roi_records = self._sample_rois(roi_records, rng=sampling_rng)
+
+        roi_list: List[ROI] = []
+        for record in roi_records:
+            if self.input_img and record.roi_path is not None:
+                with Image.open(os.path.join(self.image_path, record.roi_path)) as pil_image:
+                    image = self.transform(pil_image.convert("RGB"))
+            else:
+                image = None
+            roi_list.append(ROI(
+                global_idx=record.global_idx,
+                image=image,
+                mpp=record.mpp,
+                cxcywh=record.cxcywh,
+                roi_wh=record.roi_wh,
+            ))
 
         # Build case-level DxItem → DxResultTxt targets
         DxItem_targets = {}
@@ -213,21 +275,21 @@ class multiROI2DxResultDataset(Dataset):
             metadata_path = cfg.valid_metadata_path
 
         dataset = cls(
+            image_path=cfg.image_path,
             metadata_path=metadata_path,
             split=split,
             input_img=getattr(cfg, "input_img", True),
             input_loc=getattr(cfg, "input_loc", True),
             level_key=getattr(cfg, "level_key", "main_info"),
             max_rois_per_case=getattr(cfg, "max_rois_per_case", None),
-            roi_sampling_mode=getattr(cfg, "roi_sampling_mode", "all") if split == "train" else "tail_k",
+            roi_sampling_mode=getattr(cfg, "roi_sampling_mode", "all"),
+            valid_sampling_seed=getattr(cfg, "valid_sampling_seed", 42),
         )
 
         # Expose DxItem_list to config so model/trainer can access it
         cfg.DxItem_list = dataset.DxItem_list
 
         return dataset
-
-
 
 
 

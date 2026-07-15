@@ -17,15 +17,10 @@ from typing import Dict, Optional, List
 
 
 PROJECT_MAPPING_DICT = {
-    # ======================================================== #
-    # Pipeline Parallelism (PP) configurations
-    # Launch with:  python R27_MVLM_trainDRGVLM_v0.0.py --cfg-path <this_config>
-    # (single process, multiple GPUs via device_map)
-    # ======================================================== #
-    "MG15_basic_PP4G": {
+    "MG15_basic_overfitTesting": {
         "model_name": "medgemma-1.5-4b-it",
-        "train_ann_file": "[metadata]downstreamRepGenVLM[NAS3train]_v1.2_2607142219.json",
-        "valid_ann_file": "[metadata]downstreamRepGenVLM[NAS3val]_v1.2_2607142219.json",
+        "train_ann_file": "[metadata]downstreamRepGenVLM[NAS3test]_v2.1_2607151447.json",
+        "valid_ann_file": "[metadata]downstreamRepGenVLM[NAS3test]_v2.1_2607151447.json",
         "input_img": True,
         "input_loc": True,
         "level_key": "main_info",
@@ -33,12 +28,14 @@ PROJECT_MAPPING_DICT = {
         "accumulation_steps": 8,
         "max_rois_per_case": 30,
         "roi_sampling_mode": "random_k",
+        "valid_sampling_seed": 42,
         "use_max_roi_sampler": True,
         "max_rois_per_update": 60,
         "lora_r": 16,
         "lora_alpha": 32,
         "lora_dropout": 0.05,
         "lora_target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"],
+        "use_vision_lora": False,
         "max_new_tokens": 256,
         "general_learning_rate": 2e-4,
         "gradient_clip_norm": 1.0,
@@ -48,7 +45,42 @@ PROJECT_MAPPING_DICT = {
         "training_mode": "PP",
         "pp_num_gpus": 4,
         "attn_implementation": "sdpa",
-        "use_shared_vision_cache": True,  # set False if vision tower also has LoRA
+        "use_shared_vision_cache": True,
+    },
+    # ======================================================== #
+    # Pipeline Parallelism (PP) configurations
+    # Launch with:  python R27_MVLM_trainDRGVLM_v0.0.py --cfg-path <this_config>
+    # (single process, multiple GPUs via device_map)
+    # ======================================================== #
+    "MG15_basic_PP4G": {
+        "model_name": "medgemma-1.5-4b-it",
+        "train_ann_file": "[metadata]downstreamRepGenVLM[NAS3train]_v2.1_2607151447",
+        "valid_ann_file": "[metadata]downstreamRepGenVLM[NAS3test]_v2.1_2607151447.json",
+        "input_img": True,
+        "input_loc": True,
+        "level_key": "main_info",
+        "batch_size": 1,
+        "accumulation_steps": 8,
+        "max_rois_per_case": 30,
+        "roi_sampling_mode": "random_k",
+        "valid_sampling_seed": 42,
+        "use_max_roi_sampler": True,
+        "max_rois_per_update": 60,
+        "lora_r": 16,
+        "lora_alpha": 32,
+        "lora_dropout": 0.05,
+        "lora_target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"],
+        "use_vision_lora": False,
+        "max_new_tokens": 256,
+        "general_learning_rate": 2e-4,
+        "gradient_clip_norm": 1.0,
+        "num_epochs": 50,
+        "warmup_steps": None,
+        "early_stop_patience": 20,
+        "training_mode": "PP",
+        "pp_num_gpus": 4,
+        "attn_implementation": "sdpa",
+        "use_shared_vision_cache": True,
     },
     # ======================================================== #
     "NULLMODE": {
@@ -62,12 +94,14 @@ PROJECT_MAPPING_DICT = {
         "accumulation_steps": None,
         "max_rois_per_case": None,
         "roi_sampling_mode": None,
+        "valid_sampling_seed": 42,
         "use_max_roi_sampler": False,
         "max_rois_per_update": None,
         "lora_r": 16,
         "lora_alpha": 32,
         "lora_dropout": 0.05,
         "lora_target_modules": ["q_proj", "v_proj"],
+        "use_vision_lora": False,
         "max_new_tokens": 256,
         "general_learning_rate": None,
         "gradient_clip_norm": None,
@@ -104,13 +138,13 @@ class DRGVLM_baseConfig:
         self.setup_configHandler(project_dict=project_dict)
 
     def setup_path(self):
-        self.localGPU_image_path = "/media/yasaisen/NAS8/for_research/datasets/WSI_fromNAS"
+        self.localGPU_image_path = "/media/yasaisen/NAS8/for_research/datasets"
         self.localGPU_metadata_path = "/media/yasaisen/NAS8/for_research/metadatas"
         self.localGPU_weight_path = "/media/yasaisen/NAS8/for_research/weights"
         self.localGPU_root_path = "/media/yasaisen/NAS8/for_research/R27_MVLM_v3.18"
 
         if self.is_HPC:
-            self.image_path = "/work/misaka13/datasets/WSI_fromNAS"
+            self.image_path = "/work/misaka13/datasets"
             self.metadata_path = "/work/misaka13/metadatas"
             self.weight_path = "/work/misaka13/weights"
             self.root_path = "/work/misaka13/R27_MVLM_v3.18"
@@ -145,6 +179,7 @@ class DRGVLM_baseConfig:
         else:
             self.max_rois_per_case = 2
             self.roi_sampling_mode = "random_k"
+        self.valid_sampling_seed = int(project_dict.get("valid_sampling_seed", 42))
 
         self.use_max_roi_sampler = bool(project_dict.get("use_max_roi_sampler", False))
         self.max_rois_per_update = project_dict.get("max_rois_per_update", None)
@@ -165,13 +200,20 @@ class DRGVLM_baseConfig:
         self.lora_alpha = int(project_dict.get("lora_alpha", 32))
         self.lora_dropout = float(project_dict.get("lora_dropout", 0.05))
         self.lora_target_modules = list(project_dict.get("lora_target_modules", ["q_proj", "v_proj"]))
+        self.use_vision_lora = bool(project_dict.get("use_vision_lora", False))
 
         # Generation
         self.max_new_tokens = int(project_dict.get("max_new_tokens", 256))
 
-        # Shared vision cache (skip re-running vision tower per DxItem when True)
-        # Set False when vision tower also has LoRA adapters.
+        # Shared vision cache skips re-running the frozen vision tower per DxItem.
+        # Vision LoRA is configured independently and cannot be combined with it.
         self.use_shared_vision_cache = bool(project_dict.get("use_shared_vision_cache", True))
+        if self.use_shared_vision_cache and self.use_vision_lora:
+            raise ValueError(
+                "use_shared_vision_cache=True is incompatible with "
+                "use_vision_lora=True because the cached vision forward runs "
+                "under torch.no_grad(). Disable one of these options."
+            )
 
         # Pipeline Parallelism settings
         self.training_mode = project_dict.get("training_mode", "PP")
@@ -272,7 +314,6 @@ class DRGVLM_baseConfig:
                     save_path=save_path, 
                     filename=filename, 
                 )
-
 
 
 

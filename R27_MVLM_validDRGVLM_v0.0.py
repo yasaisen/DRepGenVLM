@@ -9,13 +9,13 @@
 """
 
 import os
-import warnings
+# import warnings
 
 # import torch
 # torch.autograd.set_detect_anomaly(True)
 
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
+# warnings.filterwarnings("ignore", category=FutureWarning)
+# warnings.filterwarnings("ignore", category=UserWarning)
 
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = '1'
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -56,4 +56,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

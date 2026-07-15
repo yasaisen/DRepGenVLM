@@ -608,6 +608,9 @@ class modelBuilder:
                     ]
                 }
             ]
+            use_bidirectional_attention = config_dict.get('use_bidirectional_attention', None) if config_dict is not None else None
+            attn_implementation = config_dict.get('attn_implementation', "sdpa") if config_dict is not None else "sdpa"
+            attn_implementation = attn_implementation or "sdpa"
             model, processor, generate_func = self._bulid_language_model(
                 model_path=os.path.join(self.weight_path, self.weight_mapping_dict[model_name]['checkpoint_path']),
                 load_visual_processor=load_visual_processor,
@@ -616,7 +619,8 @@ class modelBuilder:
                 classProcessor=classProcessor, 
                 classModel=classModel,
                 set_pad_token_as_eos=True,
-                use_bidirectional_attention=config_dict.get('use_bidirectional_attention', None),
+                use_bidirectional_attention=use_bidirectional_attention,
+                attn_implementation=attn_implementation,
                 pp_device_map=_pp_device_map,
             )
             hidden_size = model.config.text_config.hidden_size
@@ -1063,6 +1067,5 @@ class modelBuilder:
         )
 
         return builder
-
 
 

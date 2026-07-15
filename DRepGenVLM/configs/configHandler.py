@@ -16,6 +16,20 @@ from .DRGVLM_baseConfig import DRGVLM_baseConfig
 from ..common.utils import log_print
 
 
+def _parse_optional_bool(value):
+    """Parse an optional CLI boolean without treating the string 'False' as true."""
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"Expected a boolean value for --retrain, got {value!r}."
+    )
+
+
 class ConfigHandler:
     def __init__(self, 
         cfg, 
@@ -60,7 +74,17 @@ class ConfigHandler:
         parser.add_argument("--best-checkpoint-path", required=False, default=None)
         parser.add_argument("--latest-checkpoint-path", required=False, default=None)
         parser.add_argument("--weight-filename", required=False, default=None)
-        parser.add_argument("--retrain", required=False, default=None)
+        parser.add_argument(
+            "--retrain",
+            nargs="?",
+            const=True,
+            default=None,
+            type=_parse_optional_bool,
+            help=(
+                "Load LoRA weights but reset optimizer/scheduler/training state. "
+                "Accepts '--retrain', '--retrain true', or '--retrain false'."
+            ),
+        )
         parser.add_argument("--use-this-dir", action="store_true", default=False)
         args = parser.parse_args()
         cfg_path = args.cfg_path
@@ -114,7 +138,6 @@ class ConfigHandler:
         )
 
         return cfg_handler
-
 
 
 

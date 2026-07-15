@@ -153,28 +153,36 @@ class MetricsTracker:
         lr: float = None,
         rank: int = 0, 
         global_step: int = 0,
+        optimizer_step: int = None,
     ):
         if stage not in ['train', 'val']:
             raise ValueError("stage must be either 'train' or 'val'")
 
         if stage == 'train' and rank == 0:
             self.train_loss_logger.update(loss_dict)
-            self.learning_rates.append(lr)
 
             for key, value in loss_dict.items():
                 if isinstance(value, (torch.Tensor, float)):
                     self.writer.add_scalar(f"Train_general/step_{key}", float(value), global_step)
-            self.writer.add_scalar(f"Optimization/lr", float(lr), global_step)
+            if lr is not None:
+                self.learning_rates.append(float(lr))
+                lr_step = optimizer_step if optimizer_step is not None else global_step
+                self.writer.add_scalar(f"Optimization/lr", float(lr), lr_step)
 
         elif stage == 'val' and rank == 0:
             self.val_loss_logger.update(loss_dict)
 
-        loss_dict.update({
+        record = dict(loss_dict)
+        record.update({
             "stage": stage, 
             "lr": lr, 
             "rank": rank, 
+            "global_step": int(global_step),
+            "optimizer_step": (
+                int(optimizer_step) if optimizer_step is not None else None
+            ),
         })
-        self.log(record=loss_dict)
+        self.log(record=record)
 
     def epoch_summary(self, 
         metric_dict: Dict[str, float] = None, 
@@ -307,7 +315,6 @@ class PerformanceMonitor:
         
         return report
 ########################################################################
-
 
 
 

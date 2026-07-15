@@ -1,5 +1,5 @@
 {
-  "project_name": "MG15_basic_PP4G",
+  "project_name": "MG15_basic_overfitTesting",
   "is_HPC": false,
   "factory_timestamp": "2607151547",
   "localGPU_image_path": "/media/yasaisen/NAS8/for_research/datasets",
@@ -10,7 +10,7 @@
   "metadata_path": "/media/yasaisen/NAS8/for_research/metadatas",
   "weight_path": "/media/yasaisen/NAS8/for_research/weights",
   "root_path": "/media/yasaisen/NAS8/for_research/R27_MVLM_v3.18",
-  "train_metadata_path": "/media/yasaisen/NAS8/for_research/metadatas/[metadata]downstreamRepGenVLM[NAS3train]_v2.1_2607151447",
+  "train_metadata_path": "/media/yasaisen/NAS8/for_research/metadatas/[metadata]downstreamRepGenVLM[NAS3test]_v2.1_2607151447.json",
   "valid_metadata_path": "/media/yasaisen/NAS8/for_research/metadatas/[metadata]downstreamRepGenVLM[NAS3test]_v2.1_2607151447.json",
   "input_img": true,
   "input_loc": true,
