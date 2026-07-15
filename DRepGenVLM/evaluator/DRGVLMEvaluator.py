@@ -254,6 +254,8 @@ def _set_f1(reference: Set[str], hypothesis: Set[str]) -> float:
     if not reference or not hypothesis:
         return 0.0
     common = len(reference & hypothesis)
+    if common == 0:
+        return 0.0
     precision = common / len(hypothesis)
     recall = common / len(reference)
     return float(2 * precision * recall / (precision + recall))

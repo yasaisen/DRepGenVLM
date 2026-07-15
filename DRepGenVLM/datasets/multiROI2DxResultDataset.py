@@ -84,7 +84,7 @@ class multiROI2DxResultDataset(Dataset):
             metadata = json.load(f)
 
         self.DxItem_list = metadata["DxItem_list"]
-        self.case_list = metadata["case_list"]
+        self.case_list = metadata["case_list"][:16]  # Limit to first 16 cases for testing/debugging
         self.invalid_reference_records = self._find_invalid_references()
         for record in self.invalid_reference_records:
             log_print(
