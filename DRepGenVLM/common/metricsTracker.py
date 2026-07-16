@@ -28,29 +28,32 @@ class lossLogger:
     def __init__(self, 
     ):
         self.update_step_counter = 0
-        self.losses = {
-            'total_loss': [], 
-            'mse_loss': [], 
-            'cosine_loss': [], 
-            'similarity_ce_loss': [], 
-        }
+        # Loss components differ between projects.  Track only values that are
+        # actually emitted instead of pre-creating legacy empty series whose
+        # epoch means become NaN.
+        self.losses = {}
         self.epoch_losses = []
 
     def update(self, 
         loss_dict: Dict[str, float],
     ):
         for key, value in loss_dict.items():
-            if key in self.losses:
-                self.losses[key].append(value)
+            self.losses.setdefault(key, []).append(value)
         self.update_step_counter += 1
 
     def epoch_summary(self
     ):
-        epoch_summary_dict = {}
-        for key, value in self.losses.items():
-            epoch_summary_dict[key] = np.mean(value[-self.update_step_counter:])
+        if self.update_step_counter <= 0:
+            return {}
+
+        epoch_summary_dict = {
+            key: float(np.mean(values[-self.update_step_counter:]))
+            for key, values in self.losses.items()
+            if values
+        }
         self.update_step_counter = 0
-        self.epoch_losses.append(epoch_summary_dict['total_loss'])
+        if 'total_loss' in epoch_summary_dict:
+            self.epoch_losses.append(epoch_summary_dict['total_loss'])
         return epoch_summary_dict
 
 class MetricsTracker:
@@ -209,7 +212,10 @@ class MetricsTracker:
             self.log(record=metric_dict)
 
         # self.global_step += 1
-        return train_epoch_summary['total_loss'], val_epoch_summary['total_loss']
+        return (
+            train_epoch_summary.get('total_loss'),
+            val_epoch_summary.get('total_loss'),
+        )
     
     def close(self,
     ):
@@ -315,7 +321,6 @@ class PerformanceMonitor:
         
         return report
 ########################################################################
-
 
 
 

@@ -804,6 +804,9 @@ class DownstreamRepGenVLM(nn.Module):
                     **inputs,
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
+                    top_p=None,
+                    top_k=None,
+                    pad_token_id=self.vlm_processor.tokenizer.pad_token_id,
                     use_cache=True,
                 )
                 # Decode only the newly generated tokens
@@ -948,7 +951,6 @@ class DownstreamRepGenVLM(nn.Module):
 
         log_print("...Done\n")
         return model
-
 
 
 

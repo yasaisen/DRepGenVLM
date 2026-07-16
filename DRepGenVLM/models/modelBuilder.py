@@ -119,6 +119,11 @@ try:
     if hasattr(flash_attn_interface, "flash_attn_with_kvcache"):
         flash_attn_interface.flash_attn_with_kvcache = make_wrapper(flash_attn_interface.flash_attn_with_kvcache, "flash_attn_with_kvcache")
     print("[FA3 Patch] Successfully installed Bidirectional CustomBlockAttention monkey patch for head_dim > 256", flush=True)
+except ModuleNotFoundError as e:
+    # flash_attn_interface is optional; SDPA configurations do not need this
+    # compatibility patch and should not emit an alarming startup warning.
+    if e.name != "flash_attn_interface":
+        print(f"[FA3 Patch Warning] Failed to apply CustomBlockAttention monkey patch: {e}", flush=True)
 except Exception as e:
     print(f"[FA3 Patch Warning] Failed to apply CustomBlockAttention monkey patch: {e}", flush=True)
 # =====================================================================
@@ -763,8 +768,7 @@ class modelBuilder:
         
         if load_visual_processor:
             processor = classProcessor.from_pretrained(
-                model_path, 
-                torch_dtype=torch_dtype,
+                model_path,
             )
             try:
                 if processor.tokenizer.pad_token is None or set_pad_token_as_eos:
@@ -779,8 +783,7 @@ class modelBuilder:
                 
         else:
             processor = classTokenizer.from_pretrained(
-                model_path, 
-                torch_dtype=torch_dtype,
+                model_path,
             )
             if processor.pad_token is None or set_pad_token_as_eos:
                 log_print("[Warning] have no pad_token, set pad_token = eos_token")
@@ -810,7 +813,7 @@ class modelBuilder:
             model = classModel.from_pretrained(
                 model_path,
                 config=config, 
-                torch_dtype=torch_dtype,
+                dtype=torch_dtype,
                 device_map=_device_map,
                 attn_implementation=attn_implementation, 
                 low_cpu_mem_usage=True,
@@ -819,7 +822,7 @@ class modelBuilder:
         else:
             model = classModel.from_pretrained(
                 model_path,
-                torch_dtype=torch_dtype,
+                dtype=torch_dtype,
                 device_map=_device_map,
                 attn_implementation=attn_implementation, 
                 low_cpu_mem_usage=True,
@@ -1067,5 +1070,4 @@ class modelBuilder:
         )
 
         return builder
-
 

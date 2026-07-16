@@ -244,6 +244,35 @@ class DRGVLM_PPTrainer:
             if p.requires_grad and p.grad is not None and not self._is_finite_tensor(p.grad):
                 self._raise_nonfinite(f"grad[{name}]", p.grad, context)
 
+    def _assert_trainable_grads_present(self, context: str):
+        """Fail before optimizer/scheduler steps when autograd missed LoRA params."""
+        trainable = [
+            (name, p)
+            for name, p in self.get_model_raw().named_parameters()
+            if p.requires_grad
+        ]
+        if not trainable:
+            raise RuntimeError(f"No trainable parameters found. {context}")
+
+        missing = [name for name, p in trainable if p.grad is None]
+        if missing:
+            raise RuntimeError(
+                "Missing gradients for trainable parameters. "
+                f"{context}. missing={len(missing)}/{len(trainable)}, "
+                f"examples={missing[:12]}"
+            )
+
+        nonzero = [
+            name
+            for name, p in trainable
+            if bool(torch.count_nonzero(p.grad).detach().cpu().item())
+        ]
+        if not nonzero:
+            raise RuntimeError(
+                "All trainable gradients are exactly zero. "
+                f"{context}. trainable={len(trainable)}"
+            )
+
     def _assert_optimizer_state_finite(self, context: str):
         if self.optimizer is None:
             return
@@ -300,7 +329,21 @@ class DRGVLM_PPTrainer:
             total_dx_count += n_dx
             context = f"case_id={case.case_id}, rois={len(case.rois)}, DxItems={n_dx}"
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.amp):
+            # Shared-vision caching performs a no_grad VLM forward followed by a
+            # trainable decoder forward in this same autocast scope.  The default
+            # autocast weight cache can otherwise reuse detached FP32->BF16 LoRA
+            # casts from the no_grad pass and silently leave every adapter grad
+            # as None.  Keep autocast itself enabled, but disable that cache for
+            # this mixed no_grad/trainable path.
+            uses_shared_vision_cache = bool(
+                getattr(self.get_model_raw(), "use_shared_vision_cache", False)
+            )
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+                enabled=self.amp,
+                cache_enabled=not uses_shared_vision_cache,
+            ):
                 loss_dict, _ = self.get_model_raw().calculate_loss(batch_cases=[case])
 
             self._assert_loss_finite(loss_dict, context)
@@ -352,6 +395,7 @@ class DRGVLM_PPTrainer:
                     f"epoch={epoch_idx}, batch_idx={batch_idx}, "
                     f"global_step={self.global_step}, cases={batch_case_count}, dx_count={total_dx_count}"
                 )
+                self._assert_trainable_grads_present(context=f"before grad clip, {step_context}")
                 self._assert_trainable_grads_finite(context=f"before grad clip, {step_context}")
                 if self.gradient_clip_norm is not None and self.gradient_clip_norm > 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -758,7 +802,6 @@ class DRGVLM_PPTrainer:
             trainer.load_checkpoint(path=checkpoint_path)
 
         return trainer
-
 
 
 

@@ -37,7 +37,7 @@ PROJECT_MAPPING_DICT = {
         "lora_target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"],
         "use_vision_lora": False,
         "max_new_tokens": 256,
-        "general_learning_rate": 2e-4,
+        "general_learning_rate": 1e-4,
         "gradient_clip_norm": 1.0,
         "num_epochs": 50,
         "warmup_steps": None,
@@ -54,7 +54,7 @@ PROJECT_MAPPING_DICT = {
     # ======================================================== #
     "MG15_basic_PP4G": {
         "model_name": "medgemma-1.5-4b-it",
-        "train_ann_file": "[metadata]downstreamRepGenVLM[NAS3train]_v2.1_2607151447",
+        "train_ann_file": "[metadata]downstreamRepGenVLM[NAS3train]_v2.1_2607151447.json",
         "valid_ann_file": "[metadata]downstreamRepGenVLM[NAS3test]_v2.1_2607151447.json",
         "input_img": True,
         "input_loc": True,
@@ -72,7 +72,7 @@ PROJECT_MAPPING_DICT = {
         "lora_target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"],
         "use_vision_lora": False,
         "max_new_tokens": 256,
-        "general_learning_rate": 2e-4,
+        "general_learning_rate": 1e-4,
         "gradient_clip_norm": 1.0,
         "num_epochs": 50,
         "warmup_steps": None,
@@ -141,13 +141,13 @@ class DRGVLM_baseConfig:
         self.localGPU_image_path = "/media/yasaisen/NAS8/for_research/datasets"
         self.localGPU_metadata_path = "/media/yasaisen/NAS8/for_research/metadatas"
         self.localGPU_weight_path = "/media/yasaisen/NAS8/for_research/weights"
-        self.localGPU_root_path = "/media/yasaisen/NAS8/for_research/R27_MVLM_v3.18"
+        self.localGPU_root_path = "/media/yasaisen/NAS8/for_research/R27_MVLM_v3.19"
 
         if self.is_HPC:
             self.image_path = "/work/misaka13/datasets"
             self.metadata_path = "/work/misaka13/metadatas"
             self.weight_path = "/work/misaka13/weights"
-            self.root_path = "/work/misaka13/R27_MVLM_v3.18"
+            self.root_path = "/work/misaka13/R27_MVLM_v3.19"
         else:
             self.image_path = self.localGPU_image_path
             self.metadata_path = self.localGPU_metadata_path
@@ -244,7 +244,7 @@ class DRGVLM_baseConfig:
 
         self.total_steps = None  # calculated by Trainer
         self.warmup_steps = project_dict.get("warmup_steps", None)
-        self.warmup_ratio = 0.05
+        self.warmup_ratio = 0.03
         self.max_warmup_steps = 5000
 
         self.num_epochs = 50 if project_dict["num_epochs"] is None else project_dict["num_epochs"]
