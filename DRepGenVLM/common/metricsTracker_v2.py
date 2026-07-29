@@ -43,10 +43,12 @@ class TrainingMonitor:
         self.log_period = log_every_n_steps
         self.check_period = check_every_n_steps
         self.is_custom_criterion = is_custom_criterion
-        
-        # 用於計算 Throughput
+        self.phase = "idle"
         self.last_time = time.time()
-        self.step_count = 0
+        self.last_log_step = 0
+        self.pending_cases = 0
+        self.pending_dx_pairs = 0
+        self.pending_rois = 0
         
         # # 儲存 Hook 抓到的 Attention Weights
         # self.attn_weights = {}
@@ -86,22 +88,60 @@ class TrainingMonitor:
     ):
         return self.optimizer.param_groups[0]['lr']
 
-    def log_always_on(self, 
-        global_step, 
-        batch_size, 
+    def reset_phase(self, phase: str, global_step: int):
+        """Exclude validation/checkpoint time from training throughput windows."""
+        self.phase = str(phase)
+        self.last_time = time.time()
+        self.last_log_step = int(global_step)
+        self.pending_cases = 0
+        self.pending_dx_pairs = 0
+        self.pending_rois = 0
+
+    def log_always_on(self,
+        global_step,
+        batch_size,
+        dx_count: int = 0,
+        roi_count: int = 0,
     ):
         """ [常態監測] 每 N step 跑一次，計算輕量指標 """
+        self.pending_cases += int(batch_size)
+        self.pending_dx_pairs += int(dx_count)
+        self.pending_rois += int(roi_count)
         if global_step % self.log_period != 0:
             return
 
-        # 1. Throughput (Samples / Second)
+        # 1. Throughput from the actual elapsed step/work delta.  A phase reset
+        # at step 0 therefore cannot emit a fictitious step-0 throughput point.
         current_time = time.time()
         time_delta = current_time - self.last_time
-        if time_delta > 0:
-            throughput = (batch_size * self.log_period) / time_delta
-            self.writer.add_scalar('System/Throughput_samples_per_sec', throughput, global_step)
-            self.writer.add_scalar('System/Time_per_step_sec', time_delta / self.log_period, global_step)
+        step_delta = int(global_step) - self.last_log_step
+        phase_prefix = f"System/{self.phase}"
+        if time_delta > 0 and step_delta > 0:
+            self.writer.add_scalar(
+                f"{phase_prefix}/Cases_per_sec",
+                self.pending_cases / time_delta,
+                global_step,
+            )
+            self.writer.add_scalar(
+                f"{phase_prefix}/DxPairs_per_sec",
+                self.pending_dx_pairs / time_delta,
+                global_step,
+            )
+            self.writer.add_scalar(
+                f"{phase_prefix}/ROIs_per_sec",
+                self.pending_rois / time_delta,
+                global_step,
+            )
+            self.writer.add_scalar(
+                f"{phase_prefix}/Time_per_step_sec",
+                time_delta / step_delta,
+                global_step,
+            )
         self.last_time = current_time
+        self.last_log_step = int(global_step)
+        self.pending_cases = 0
+        self.pending_dx_pairs = 0
+        self.pending_rois = 0
 
         # 2. Global Gradient Norm
         total_norm = 0.0
@@ -140,12 +180,12 @@ class TrainingMonitor:
         # redundant cross-process queries; rank is derived without assuming
         # LOCAL_RANK is set.
         is_distributed = dist.is_available() and dist.is_initialized()
-        if is_distributed:
+        if torch.cuda.is_available() and is_distributed:
             # DDP path: each rank logs its own GPU only
             local_rank = int(os.environ.get("LOCAL_RANK", dist.get_rank()))
             current_vram = torch.cuda.memory_reserved(local_rank) / (1024 ** 3)
             self.writer.add_scalar(f'VRAM_By_GPU/GPU_{local_rank}', current_vram, global_step=global_step)
-        else:
+        elif torch.cuda.is_available():
             # PP / single-GPU path: this process owns all visible GPUs, query each directly
             num_gpus = torch.cuda.device_count()
             for gpu_id in range(num_gpus):
@@ -289,7 +329,6 @@ class TrainingMonitor:
     # ):
     #     for h in self.hook_handles:
     #         h.remove()
-
 
 
 

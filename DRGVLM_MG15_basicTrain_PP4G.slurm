@@ -4,7 +4,7 @@
 #SBATCH --account=MST114560
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=12
-#SBATCH --gpus-per-node=8
+#SBATCH --gpus-per-node=4
 #SBATCH --output=logs/job-%j.out
 #SBATCH --error=logs/job-%j.err
 #SBATCH --mail-type=ALL
@@ -25,4 +25,4 @@ echo "Num GPUs: $SLURM_GPUS_PER_NODE"
 source /home/misaka13/anaconda3/etc/profile.d/conda.sh
 conda activate MVLM_CLEE
 
-python /home/misaka13/R27_MVLM_v3.18.5/DRepGenVLM/R27_MVLM_trainDRGVLM_v0.0.py --cfg-path /home/misaka13/R27_MVLM_v3.18.5/DRepGenVLM/DRepGenVLM/projects/MG15_basic_PP4G_config_hpc.json
+python /home/misaka13/R27_MVLM_v3.18.5/DRepGenVLM/R27_MVLM_trainDRGVLM_v0.0.py --cfg-path /home/misaka13/R27_MVLM_v3.18.5/DRepGenVLM/DRepGenVLM/projects/MG15_basic_R30_PP4G_config_hpc.json

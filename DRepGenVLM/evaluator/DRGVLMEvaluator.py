@@ -13,6 +13,7 @@ from datetime import datetime
 import json
 import os
 import re
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -164,21 +165,62 @@ _INVALID_TYPE_LABELS = {
 
 
 def _parse_histologic_type(text: str) -> Dict[str, Any]:
+    """Normalize histologic type without conflating in-situ and invasive disease."""
     normalized = _normalize_text(text)
     compact_alpha = "".join(ch for ch in normalized if ch.isalpha())
     valid = normalized not in _INVALID_TYPE_LABELS and len(compact_alpha) >= 3
     canonical = None
     if valid:
-        has_invasive = "invasive" in normalized or "infiltrating" in normalized
-        if "cribriform" in normalized and "carcinoma" in normalized:
+        has_carcinoma = "carcinoma" in normalized
+        is_idc = bool(re.search(r"\bidc\b", normalized))
+        is_ilc = bool(re.search(r"\bilc\b", normalized))
+        has_invasive = bool(
+            re.search(r"\b(?:invasive|infiltrating)\b", normalized)
+            or is_idc
+            or is_ilc
+        )
+        is_dcis = bool(
+            re.search(r"\bdcis\b", normalized)
+            or "ductal carcinoma in situ" in normalized
+        )
+        is_lcis = bool(
+            re.search(r"\blcis\b", normalized)
+            or "lobular carcinoma in situ" in normalized
+        )
+        is_ductal = bool(
+            re.search(r"\b(?:duct|ductal)\b", normalized)
+            or is_idc
+            or "no special type" in normalized
+            or re.search(r"\bnst\b", normalized)
+        )
+        is_lobular = bool(re.search(r"\blobular\b", normalized) or is_ilc)
+
+        # Specific in-situ entities must be resolved before any generic
+        # ductal/lobular carcinoma rules.
+        if is_dcis and not has_invasive:
+            canonical = "ductal carcinoma in situ"
+        elif is_lcis and not has_invasive:
+            canonical = "lobular carcinoma in situ"
+        elif (
+            has_invasive
+            and "cribriform" in normalized
+            and has_carcinoma
+        ):
             canonical = "invasive cribriform carcinoma"
-        elif "duct" in normalized and "carcinoma" in normalized:
+        elif has_invasive and is_ductal and (has_carcinoma or "idc" in normalized):
             if "mucin" in normalized:
                 canonical = "invasive duct carcinoma with extracellular mucin"
             else:
                 canonical = "invasive duct carcinoma"
-        elif has_invasive and "carcinoma" in normalized:
+        elif has_invasive and is_lobular and (has_carcinoma or "ilc" in normalized):
+            canonical = "invasive lobular carcinoma"
+        elif has_invasive and has_carcinoma:
             canonical = "invasive carcinoma"
+        elif is_ductal and has_carcinoma:
+            # Do not silently promote an ambiguous ductal carcinoma to invasive.
+            canonical = "ductal carcinoma unspecified invasion"
+        elif is_lobular and has_carcinoma:
+            canonical = "lobular carcinoma unspecified invasion"
         else:
             canonical = normalized
     return {
@@ -214,6 +256,92 @@ def _parse_histologic_grade(text: str) -> Dict[str, Optional[int]]:
             normalized,
         ),
     }
+
+
+_GRADE_CLASS_TO_INT = {
+    "Grade I": 1,
+    "Grade II": 2,
+    "Grade III": 3,
+}
+_SCORE_CLASS_TO_INT = {
+    "Score 1": 1,
+    "Score 2": 2,
+    "Score 3": 3,
+}
+_GRADE_REFERENCE_FIELDS = {
+    "grade": ("Histologic_Grade", _GRADE_CLASS_TO_INT),
+    "tubular_formation": ("Tubular_formation", _SCORE_CLASS_TO_INT),
+    "nuclear_pleomorphism": ("Nuclear_pleomorphism", _SCORE_CLASS_TO_INT),
+    "mitotic_count": ("Mitotic_count", _SCORE_CLASS_TO_INT),
+}
+
+
+def _grade_from_total_score(total_score: Optional[int]) -> Optional[int]:
+    if total_score is None:
+        return None
+    if 3 <= total_score <= 5:
+        return 1
+    if 6 <= total_score <= 7:
+        return 2
+    if 8 <= total_score <= 9:
+        return 3
+    return None
+
+
+def _grade_reference_from_classes(
+    target_classes: Dict[str, str],
+) -> Dict[str, Any]:
+    """Build the Nottingham reference only from authoritative class labels."""
+    reference: Dict[str, Any] = {}
+    source_classes: Dict[str, str] = {}
+    for output_field, (dx_item, mapping) in _GRADE_REFERENCE_FIELDS.items():
+        raw_value = target_classes.get(dx_item)
+        if not isinstance(raw_value, str):
+            raise ValueError(
+                f"Missing DxResultCls for required grade field {dx_item!r}"
+            )
+        class_value = raw_value.strip()
+        if class_value not in mapping:
+            raise ValueError(
+                f"Unsupported DxResultCls for {dx_item!r}: {raw_value!r}; "
+                f"expected one of {sorted(mapping)}"
+            )
+        source_classes[dx_item] = class_value
+        reference[output_field] = mapping[class_value]
+
+    reference["total_score"] = (
+        reference["tubular_formation"]
+        + reference["nuclear_pleomorphism"]
+        + reference["mitotic_count"]
+    )
+    reference["grade_from_total"] = _grade_from_total_score(
+        reference["total_score"]
+    )
+    reference["grade_total_consistent"] = (
+        reference["grade"] == reference["grade_from_total"]
+    )
+    reference["source_classes"] = source_classes
+    return reference
+
+
+def _complete_grade_prediction(text: str) -> Dict[str, Any]:
+    """Parse a prediction and derive grade from total only when grade is absent."""
+    prediction: Dict[str, Any] = dict(_parse_histologic_grade(text))
+    explicit_grade = prediction["grade"]
+    total_derived_grade = _grade_from_total_score(prediction["total_score"])
+    prediction["explicit_grade"] = explicit_grade
+    prediction["grade_from_total"] = total_derived_grade
+    prediction["grade_was_derived"] = (
+        explicit_grade is None and total_derived_grade is not None
+    )
+    prediction["grade_total_conflict"] = (
+        explicit_grade is not None
+        and total_derived_grade is not None
+        and explicit_grade != total_derived_grade
+    )
+    if prediction["grade_was_derived"]:
+        prediction["grade"] = total_derived_grade
+    return prediction
 
 
 def _parse_microcalcification(text: str) -> Dict[str, Any]:
@@ -268,6 +396,8 @@ def _set_f1(reference: Set[str], hypothesis: Set[str]) -> float:
 class DRGVLMEvaluator:
     """Evaluate both language realization and clinical content correctness."""
 
+    CLINICAL_METRIC_SCHEMA_VERSION = 3
+
     TEXT_METRIC_KEYS = (
         "exact_match",
         "bleu",
@@ -277,30 +407,151 @@ class DRGVLMEvaluator:
         "token_recall",
     )
 
-    def __init__(self, DxItem_list: List[str]):
+    def __init__(
+        self,
+        DxItem_list: List[str],
+        strict_prediction_completeness: bool = True,
+        reference_metadata_path: Optional[str] = None,
+    ):
         self.DxItem_list = list(DxItem_list)
+        self.strict_prediction_completeness = bool(
+            strict_prediction_completeness
+        )
+        self.reference_metadata_path = reference_metadata_path
+        self._reference_class_lookup: Optional[
+            Dict[Tuple[str, str], Dict[str, str]]
+        ] = None
+        self._reset_state()
+
+    def _reset_state(self):
         self.cases_list: List[Dict[str, Any]] = []
+        self._seen_case_indices: Set[int] = set()
+        self._prediction_completeness: Dict[str, Any] = {
+            "strict": self.strict_prediction_completeness,
+            "expected_prediction_count": 0,
+            "present_prediction_count": 0,
+            "missing_prediction_count": 0,
+            "empty_prediction_count": 0,
+            "unexpected_output_count": 0,
+            "duplicate_case_count": 0,
+            "diagnostics": [],
+        }
 
     def update(
         self,
         batch_cases: List[Case],
         output_case_dict: Dict[int, Dict[str, Any]],
     ):
+        expected_dx_items = set(self.DxItem_list)
+        batch_case_indices = {case.global_idx for case in batch_cases}
+        local_counts = {
+            "expected_prediction_count": 0,
+            "present_prediction_count": 0,
+            "missing_prediction_count": 0,
+            "empty_prediction_count": 0,
+            "unexpected_output_count": 0,
+            "duplicate_case_count": 0,
+        }
+        diagnostics: List[str] = []
+        new_entries: List[Dict[str, Any]] = []
+        new_case_indices: Set[int] = set()
+
+        for global_idx, outputs in output_case_dict.items():
+            if global_idx in batch_case_indices:
+                continue
+            count = len(outputs) if isinstance(outputs, dict) else 1
+            local_counts["unexpected_output_count"] += max(1, count)
+            diagnostics.append(
+                f"unexpected global_idx={global_idx!r} in output_case_dict"
+            )
+
         for case in batch_cases:
+            global_idx = case.global_idx
+            if (
+                global_idx in self._seen_case_indices
+                or global_idx in new_case_indices
+            ):
+                local_counts["duplicate_case_count"] += 1
+                diagnostics.append(
+                    f"duplicate case global_idx={global_idx!r}, "
+                    f"case_id={case.case_id!r}"
+                )
+                continue
+
+            case_outputs = output_case_dict.get(global_idx, {})
+            if not isinstance(case_outputs, dict):
+                diagnostics.append(
+                    f"non-dict output for global_idx={global_idx!r}"
+                )
+                case_outputs = {}
+
+            unexpected_dx_items = set(case_outputs) - expected_dx_items
+            if unexpected_dx_items:
+                local_counts["unexpected_output_count"] += len(
+                    unexpected_dx_items
+                )
+                diagnostics.append(
+                    f"unexpected DxItems for global_idx={global_idx!r}: "
+                    f"{sorted(unexpected_dx_items)}"
+                )
+
             case_entry: Dict[str, Any] = {
-                "global_idx": case.global_idx,
+                "global_idx": global_idx,
                 "case_id": str(case.case_id),
                 "DxItem_dict": {},
+                "DxItem_target_classes": dict(
+                    getattr(case, "DxItem_target_classes", {})
+                ),
             }
             for dx_item in self.DxItem_list:
-                pred_info = output_case_dict.get(case.global_idx, {}).get(dx_item)
-                if pred_info is None:
-                    continue
+                local_counts["expected_prediction_count"] += 1
+                pred_info = case_outputs.get(dx_item)
+                prediction_present = isinstance(pred_info, dict)
+                if prediction_present:
+                    local_counts["present_prediction_count"] += 1
+                    pred_txt = pred_info.get("pred_txt", "") or ""
+                    if not str(pred_txt).strip():
+                        local_counts["empty_prediction_count"] += 1
+                else:
+                    local_counts["missing_prediction_count"] += 1
+                    diagnostics.append(
+                        f"missing prediction: global_idx={global_idx!r}, "
+                        f"case_id={case.case_id!r}, DxItem={dx_item}"
+                    )
+                    pred_txt = ""
+
+                gt_txt = getattr(case, "DxItem_targets", {}).get(dx_item, "") or ""
                 case_entry["DxItem_dict"][dx_item] = {
-                    "pred_txt": pred_info.get("pred_txt", "") or "",
-                    "gt_txt": pred_info.get("gt_txt", "") or "",
+                    "pred_txt": str(pred_txt),
+                    "gt_txt": str(gt_txt),
+                    "prediction_present": prediction_present,
                 }
-            self.cases_list.append(case_entry)
+
+            new_entries.append(case_entry)
+            new_case_indices.add(global_idx)
+
+        structural_error_count = (
+            local_counts["missing_prediction_count"]
+            + local_counts["empty_prediction_count"]
+            + local_counts["unexpected_output_count"]
+            + local_counts["duplicate_case_count"]
+        )
+        if self.strict_prediction_completeness and structural_error_count:
+            preview = "; ".join(diagnostics[:8])
+            raise ValueError(
+                "Incomplete or inconsistent evaluator predictions: "
+                f"missing={local_counts['missing_prediction_count']}, "
+                f"empty={local_counts['empty_prediction_count']}, "
+                f"unexpected={local_counts['unexpected_output_count']}, "
+                f"duplicate_cases={local_counts['duplicate_case_count']}. "
+                f"Examples: {preview}"
+            )
+
+        for key, value in local_counts.items():
+            self._prediction_completeness[key] += value
+        self._prediction_completeness["diagnostics"].extend(diagnostics)
+        self.cases_list.extend(new_entries)
+        self._seen_case_indices.update(new_case_indices)
 
     @staticmethod
     def _invalid_record(
@@ -340,12 +591,15 @@ class DRGVLMEvaluator:
             "micro_location_f1": [],
             "micro_parser_coverage": [],
         }
+        grade_prediction_conflicts: List[Dict[str, Any]] = []
 
         for entry in self.cases_list:
             case_dx_dict: Dict[str, Any] = {}
-            for dx_item, texts in entry["DxItem_dict"].items():
+            for dx_item in self.DxItem_list:
+                texts = entry["DxItem_dict"][dx_item]
                 pred_txt = texts["pred_txt"]
                 gt_txt = texts["gt_txt"]
+                prediction_present = bool(texts["prediction_present"])
                 pred_tokens = _tokenize(pred_txt)
                 gt_tokens = _tokenize(gt_txt)
                 precision, recall, f1 = token_f1(gt_tokens, pred_tokens)
@@ -357,6 +611,12 @@ class DRGVLMEvaluator:
                     "token_precision": precision,
                     "token_recall": recall,
                 }
+                if not prediction_present:
+                    # Lenient mode must retain missing items in every denominator.
+                    text_metrics = {
+                        metric_name: 0.0
+                        for metric_name in self.TEXT_METRIC_KEYS
+                    }
                 if dx_item in text_accum:
                     for metric_name, metric_value in text_metrics.items():
                         text_accum[dx_item][metric_name].append(metric_value)
@@ -391,9 +651,18 @@ class DRGVLMEvaluator:
                         ))
 
                 elif dx_item == "Histologic_Grade":
-                    reference = _parse_histologic_grade(gt_txt)
-                    prediction = _parse_histologic_grade(pred_txt)
-                    valid_reference = reference["grade"] is not None
+                    try:
+                        reference = _grade_reference_from_classes(
+                            entry["DxItem_target_classes"]
+                        )
+                    except ValueError as exc:
+                        raise ValueError(
+                            "Invalid authoritative grade reference: "
+                            f"global_idx={entry['global_idx']!r}, "
+                            f"case_id={entry['case_id']!r}: {exc}"
+                        ) from exc
+                    prediction = _complete_grade_prediction(pred_txt)
+                    valid_reference = True
                     field_correctness: Dict[str, Optional[float]] = {}
                     field_to_accumulator = {
                         "grade": "grade_overall_accuracy",
@@ -402,37 +671,30 @@ class DRGVLMEvaluator:
                         "mitotic_count": "grade_mitotic_accuracy",
                         "total_score": "grade_total_accuracy",
                     }
-                    if valid_reference:
-                        for field_name, accumulator_name in field_to_accumulator.items():
-                            if reference[field_name] is None:
-                                field_correctness[field_name] = None
-                                continue
-                            correct = float(
-                                prediction[field_name] == reference[field_name]
-                            )
-                            field_correctness[field_name] = correct
-                            clinical_accum[accumulator_name].append(correct)
-                        required_results = [
-                            value for value in field_correctness.values()
-                            if value is not None
-                        ]
-                        complete_correct = float(
-                            bool(required_results) and all(required_results)
+                    for field_name, accumulator_name in field_to_accumulator.items():
+                        correct = float(
+                            prediction[field_name] == reference[field_name]
                         )
-                        clinical_accum["grade_complete_accuracy"].append(
-                            complete_correct
+                        field_correctness[field_name] = correct
+                        clinical_accum[accumulator_name].append(correct)
+                    complete_correct = float(all(field_correctness.values()))
+                    clinical_accum["grade_complete_accuracy"].append(
+                        complete_correct
+                    )
+                    clinical_accum["grade_parser_coverage"].append(float(
+                        all(
+                            prediction[field_name] is not None
+                            for field_name in field_to_accumulator
                         )
-                        clinical_accum["grade_parser_coverage"].append(
-                            float(prediction["grade"] is not None)
-                        )
-                    else:
-                        complete_correct = None
-                        invalid_references.append(self._invalid_record(
-                            entry,
-                            dx_item,
-                            gt_txt,
-                            "unable to parse overall Nottingham grade",
-                        ))
+                    ))
+                    if prediction["grade_total_conflict"]:
+                        grade_prediction_conflicts.append({
+                            "global_idx": entry["global_idx"],
+                            "case_id": entry["case_id"],
+                            "explicit_grade": prediction["explicit_grade"],
+                            "grade_from_total": prediction["grade_from_total"],
+                            "prediction": pred_txt,
+                        })
                     structured = {
                         "reference": reference,
                         "prediction": prediction,
@@ -500,6 +762,8 @@ class DRGVLMEvaluator:
                 case_dx_dict[dx_item] = {
                     "pred_txt": pred_txt,
                     "gt_txt": gt_txt,
+                    "gt_cls": entry["DxItem_target_classes"].get(dx_item),
+                    "prediction_present": prediction_present,
                     "text_metrics": text_metrics,
                     "structured": structured,
                 }
@@ -507,6 +771,9 @@ class DRGVLMEvaluator:
             eval_cases.append({
                 "global_idx": entry["global_idx"],
                 "case_id": entry["case_id"],
+                "DxItem_target_classes": dict(
+                    entry["DxItem_target_classes"]
+                ),
                 "DxItem_dict": case_dx_dict,
             })
 
@@ -591,26 +858,66 @@ class DRGVLMEvaluator:
                 ),
             },
         }
-        clinical_composite_values = [
-            clinical["Histologic_Type"]["accuracy"],
-            clinical["Histologic_Grade"]["overall_accuracy"],
-            clinical["Microcalcification"]["status_accuracy"],
-            clinical["Microcalcification"]["location_f1"],
-        ]
+
+        grade_component_names = (
+            "overall_accuracy",
+            "tubular_formation_accuracy",
+            "nuclear_pleomorphism_accuracy",
+            "mitotic_count_accuracy",
+            "total_score_accuracy",
+        )
+        grade_task_score = _mean_or_none([
+            float(clinical["Histologic_Grade"][name])
+            for name in grade_component_names
+            if clinical["Histologic_Grade"][name] is not None
+        ])
+        # Status remains the primary microcalcification classification because
+        # absent and not_identified intentionally retain different meanings.
+        micro_task_score = _mean_or_none([
+            float(value)
+            for value in (
+                clinical["Microcalcification"]["status_accuracy"],
+                clinical["Microcalcification"]["location_f1"],
+            )
+            if value is not None
+        ])
+        clinical["Histologic_Type"]["task_score"] = clinical[
+            "Histologic_Type"
+        ]["accuracy"]
+        clinical["Histologic_Grade"]["task_score"] = grade_task_score
+        clinical["Microcalcification"]["task_score"] = micro_task_score
+
+        clinical_task_scores = {
+            dx_item: clinical[dx_item]["task_score"]
+            for dx_item in (
+                "Histologic_Type",
+                "Histologic_Grade",
+                "Microcalcification",
+            )
+        }
         clinical_macro_score = _mean_or_none([
             float(value)
-            for value in clinical_composite_values
+            for value in clinical_task_scores.values()
             if value is not None
         ])
 
         summary: Dict[str, Any] = {
+            "clinical_metric_schema_version": (
+                self.CLINICAL_METRIC_SCHEMA_VERSION
+            ),
             "per_DxItem": per_dx_metrics,
             **macro,
             "text_composite": text_composite,
             "clinical": clinical,
+            "clinical_task_scores": clinical_task_scores,
             "clinical_macro_score": clinical_macro_score,
+            "prediction_completeness": dict(self._prediction_completeness),
             "invalid_reference_count": len(invalid_references),
             "invalid_references": invalid_references,
+            "grade_prediction_conflict_count": len(
+                grade_prediction_conflicts
+            ),
+            "grade_prediction_conflicts": grade_prediction_conflicts,
         }
         return eval_cases, summary
 
@@ -631,6 +938,116 @@ class DRGVLMEvaluator:
         # to TensorBoard/checkpoint score selection.
         return output
 
+    def recompute_saved_cases(
+        self,
+        stored_cases: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Recompute the current metric schema from saved case predictions."""
+        self._reset_state()
+        try:
+            for stored_case in stored_cases:
+                stored_dx = stored_case.get("DxItem_dict", {})
+                targets: Dict[str, str] = {}
+                stored_classes = stored_case.get("DxItem_target_classes", {})
+                target_classes: Dict[str, str] = (
+                    {
+                        str(dx_item): str(value)
+                        for dx_item, value in stored_classes.items()
+                        if isinstance(value, str)
+                    }
+                    if isinstance(stored_classes, dict)
+                    else {}
+                )
+                outputs: Dict[str, Dict[str, str]] = {}
+                for dx_item in self.DxItem_list:
+                    record = stored_dx.get(dx_item)
+                    if not isinstance(record, dict):
+                        continue
+                    targets[dx_item] = str(record.get("gt_txt", "") or "")
+                    gt_cls = record.get("gt_cls")
+                    if isinstance(gt_cls, str):
+                        target_classes[dx_item] = gt_cls
+                    if bool(record.get("prediction_present", True)):
+                        outputs[dx_item] = {
+                            "pred_txt": str(record.get("pred_txt", "") or ""),
+                        }
+
+                if (
+                    "Histologic_Grade" in self.DxItem_list
+                    and any(
+                        dx_item not in target_classes
+                        for _, (dx_item, _) in _GRADE_REFERENCE_FIELDS.items()
+                    )
+                ):
+                    target_classes.update(self._lookup_reference_classes(
+                        global_idx=stored_case.get("global_idx"),
+                        case_id=str(stored_case.get("case_id", "")),
+                    ))
+
+                case = SimpleNamespace(
+                    global_idx=stored_case.get("global_idx"),
+                    case_id=str(stored_case.get("case_id", "")),
+                    DxItem_targets=targets,
+                    DxItem_target_classes=target_classes,
+                )
+                self.update(
+                    batch_cases=[case],
+                    output_case_dict={case.global_idx: outputs},
+                )
+
+            _, summary = self._evaluate()
+            return self._flatten_metrics(summary)
+        finally:
+            self._reset_state()
+
+    def _lookup_reference_classes(
+        self,
+        global_idx: Any,
+        case_id: str,
+    ) -> Dict[str, str]:
+        """Load classes for legacy schema-v1/v2 evaluation JSON files."""
+        if self._reference_class_lookup is None:
+            if not self.reference_metadata_path:
+                raise ValueError(
+                    "Legacy evaluation cases do not contain gt_cls. Set "
+                    "reference_metadata_path so schema-v3 metrics can use "
+                    "metadata DxResultCls instead of parsing gt_txt."
+                )
+            with open(
+                self.reference_metadata_path,
+                "r",
+                encoding="utf-8",
+            ) as file:
+                metadata = json.load(file)
+            lookup: Dict[Tuple[str, str], Dict[str, str]] = {}
+            for sample in metadata.get("case_list", []):
+                classes = {
+                    str(dx_item): str(dx_sample["DxResultCls"])
+                    for dx_item, dx_sample in sample.get(
+                        "structured_report",
+                        {},
+                    ).get("DxItems", {}).items()
+                    if isinstance(dx_sample, dict)
+                    and isinstance(dx_sample.get("DxResultCls"), str)
+                }
+                lookup[("global_idx", str(sample.get("sample_idx")))] = classes
+                lookup[("case_id", str(sample.get("case_id", "")))] = classes
+            self._reference_class_lookup = lookup
+
+        by_index = self._reference_class_lookup.get(
+            ("global_idx", str(global_idx))
+        )
+        by_case_id = self._reference_class_lookup.get(
+            ("case_id", str(case_id))
+        )
+        classes = by_index or by_case_id
+        if classes is None:
+            raise ValueError(
+                "Unable to find authoritative DxResultCls in reference "
+                f"metadata for global_idx={global_idx!r}, case_id={case_id!r}"
+            )
+        return dict(classes)
+
     def evaluate(
         self,
         epoch_idx: int = 0,
@@ -642,6 +1059,7 @@ class DRGVLMEvaluator:
         def _fmt(value: Optional[float]) -> str:
             return "n/a" if value is None else f"{value:.4f}"
 
+        completeness = metrics_dict.get("prediction_completeness", {})
         log_print(
             f"[DRGVLMEvaluator] epoch={epoch_str}: "
             f"text_composite={_fmt(metrics_dict.get('text_composite'))}, "
@@ -649,6 +1067,12 @@ class DRGVLMEvaluator:
             f"EM={_fmt(metrics_dict.get('macro_exact_match'))}, "
             f"BLEU={_fmt(metrics_dict.get('macro_bleu'))}, "
             f"ROUGE-L={_fmt(metrics_dict.get('macro_rouge_l'))}, "
+            f"predictions={completeness.get('present_prediction_count', 0)}/"
+            f"{completeness.get('expected_prediction_count', 0)}, "
+            f"missing={completeness.get('missing_prediction_count', 0)}, "
+            f"empty={completeness.get('empty_prediction_count', 0)}, "
+            "grade_prediction_conflicts="
+            f"{metrics_dict.get('grade_prediction_conflict_count', 0)}, "
             f"invalid_references={metrics_dict.get('invalid_reference_count', 0)}"
         )
         for invalid in metrics_dict.get("invalid_references", []):
@@ -656,6 +1080,17 @@ class DRGVLMEvaluator:
                 "[DRGVLMEvaluator][INVALID_REFERENCE] "
                 f"case_id={invalid['case_id']}, DxItem={invalid['DxItem']}, "
                 f"value={invalid['value']!r}, reason={invalid['reason']}"
+            )
+        for conflict in metrics_dict.get(
+            "grade_prediction_conflicts",
+            [],
+        ):
+            log_print(
+                "[DRGVLMEvaluator][GRADE_PREDICTION_CONFLICT] "
+                f"case_id={conflict['case_id']}, "
+                f"explicit_grade={conflict['explicit_grade']}, "
+                f"grade_from_total={conflict['grade_from_total']}, "
+                f"prediction={conflict['prediction']!r}"
             )
 
         if save_path is not None:
@@ -674,9 +1109,21 @@ class DRGVLMEvaluator:
             log_print(f"Saved eval results to {out_path}")
 
         flat = self._flatten_metrics(metrics_dict)
-        self.cases_list = []
+        self._reset_state()
         return flat
 
     @classmethod
     def from_config(cls, cfg: DRGVLM_baseConfig) -> "DRGVLMEvaluator":
-        return cls(DxItem_list=cfg.DxItem_list)
+        return cls(
+            DxItem_list=cfg.DxItem_list,
+            strict_prediction_completeness=getattr(
+                cfg,
+                "strict_evaluator_predictions",
+                True,
+            ),
+            reference_metadata_path=getattr(
+                cfg,
+                "valid_metadata_path",
+                None,
+            ),
+        )

@@ -25,10 +25,17 @@
 """
 
 
+import glob
+import hashlib
 import math
 import os
 import json
+import random
+import shutil
+import tempfile
+import uuid
 from contextlib import nullcontext
+from datetime import datetime
 from typing import Dict, List, Tuple, Any, Optional
 
 import numpy as np
@@ -101,6 +108,15 @@ class DRGVLM_PPTrainer:
         self.best_metric_values: Dict[str, Any] = {}
         self.patience_counter = 0
         self.resume_num_batches_per_epoch = None
+        self.resume_checkpoint_path: Optional[str] = None
+        self.resume_checkpoint_root: Optional[str] = None
+        self.resume_signature_static: Dict[str, Any] = {}
+        self.current_resume_signature: Dict[str, Any] = {}
+        self._loaded_resume_signature: Optional[Dict[str, Any]] = None
+        self._pending_train_generator_state = None
+        self._active_train_generator = None
+        self._snapshot_cache_key = None
+        self._snapshot_cache_path = None
 
         log_print(f"home device = {self.device}")
 
@@ -172,7 +188,11 @@ class DRGVLM_PPTrainer:
         self.optimizer = optim.AdamW(params=param_dicts, lr=lr_dict["general"], betas=betas)
 
         total_steps = max(1, int(total_steps))
-        warmup_steps = int(max(0, min(warmup_steps, total_steps)))
+        warmup_steps = int(warmup_steps)
+        if warmup_steps < 0:
+            raise ValueError(
+                f"warmup_steps must be non-negative, got {warmup_steps}."
+            )
 
         self.scheduler = build_cosine_annealing_with_warmup_scheduler(
             optimizer=self.optimizer,
@@ -320,21 +340,25 @@ class DRGVLM_PPTrainer:
     ) -> Tuple[Dict[str, float], int]:
         case_list = self._as_case_list(batch_cases)
         case_count = max(1, len(case_list))
-        loss_scale = max(1, int(accumulation_denom)) * case_count
+        accumulation_denom = max(1, int(accumulation_denom))
         loss_dict_buffer: List[Dict[str, float]] = []
         total_dx_count = 0
 
         for case in case_list:
             n_dx = len(getattr(case, "DxItem_targets", {}))
+            if n_dx == 0:
+                raise RuntimeError(
+                    f"Case has no DxItem targets: case_id={case.case_id}"
+                )
             total_dx_count += n_dx
-            context = f"case_id={case.case_id}, rois={len(case.rois)}, DxItems={n_dx}"
+            case_context_str = (
+                f"case_id={case.case_id}, rois={len(case.rois)}, DxItems={n_dx}"
+            )
 
             # Shared-vision caching performs a no_grad VLM forward followed by a
-            # trainable decoder forward in this same autocast scope.  The default
-            # autocast weight cache can otherwise reuse detached FP32->BF16 LoRA
-            # casts from the no_grad pass and silently leave every adapter grad
-            # as None.  Keep autocast itself enabled, but disable that cache for
-            # this mixed no_grad/trainable path.
+            # trainable decoder forward.  Disable the autocast weight cache on
+            # this path so detached FP32->BF16 LoRA casts from the no_grad pass
+            # can never be reused by a trainable pair forward.
             uses_shared_vision_cache = bool(
                 getattr(self.get_model_raw(), "use_shared_vision_cache", False)
             )
@@ -344,13 +368,37 @@ class DRGVLM_PPTrainer:
                 enabled=self.amp,
                 cache_enabled=not uses_shared_vision_cache,
             ):
-                loss_dict, _ = self.get_model_raw().calculate_loss(batch_cases=[case])
+                case_context = self.get_model_raw().prepare_case_loss_context(case)
 
-            self._assert_loss_finite(loss_dict, context)
-            scaled_loss = loss_dict["total_loss"] / loss_scale
-            scaled_loss.backward()
+            pair_loss_dict_buffer: List[Dict[str, float]] = []
+            pair_loss_scale = accumulation_denom * case_count * n_dx
+            for DxItem in case.DxItem_targets:
+                pair_context = f"{case_context_str}, DxItem={DxItem}"
+                with torch.autocast(
+                    device_type="cuda",
+                    dtype=torch.bfloat16,
+                    enabled=self.amp,
+                    cache_enabled=not uses_shared_vision_cache,
+                ):
+                    loss_dict = self.get_model_raw().calculate_dxitem_loss(
+                        case=case,
+                        DxItem=DxItem,
+                        case_context=case_context,
+                    )
 
-            loss_dict_buffer.append({k: float(v.detach().item()) for k, v in loss_dict.items()})
+                self._assert_loss_finite(loss_dict, pair_context)
+                scaled_loss = loss_dict["total_loss"] / pair_loss_scale
+                scaled_loss.backward()
+                pair_loss_dict_buffer.append({
+                    k: float(v.detach().item())
+                    for k, v in loss_dict.items()
+                })
+                del scaled_loss, loss_dict
+
+            loss_dict_buffer.append(
+                self._mean_float_dict(pair_loss_dict_buffer)
+            )
+            del case_context
 
         return self._mean_float_dict(loss_dict_buffer), total_dx_count
 
@@ -362,6 +410,10 @@ class DRGVLM_PPTrainer:
         epoch_idx: int,
     ) -> float:
         self.get_model_raw().train()
+        self.monitor.reset_phase(
+            phase="train",
+            global_step=self.global_step,
+        )
         epoch_losses: List[float] = []
         num_batches = len(dataloader)
         pbar = tqdm(dataloader, desc=f"Epoch {epoch_idx} [Train]")
@@ -384,9 +436,18 @@ class DRGVLM_PPTrainer:
                 )
 
             batch_case_count = len(self._as_case_list(batch))
-            self.monitor.log_always_on(self.global_step, batch_size=batch_case_count)
-            self.monitor.log_periodic(self.global_step)
             self.global_step += 1
+            batch_roi_count = sum(
+                len(getattr(case, "rois", []))
+                for case in self._as_case_list(batch)
+            )
+            self.monitor.log_always_on(
+                self.global_step,
+                batch_size=batch_case_count,
+                dx_count=total_dx_count,
+                roi_count=batch_roi_count,
+            )
+            self.monitor.log_periodic(self.global_step)
             epoch_losses.append(float(loss_dict["total_loss"]))
 
             optimizer_step_lr = None
@@ -448,14 +509,28 @@ class DRGVLM_PPTrainer:
         do_eval = (self.evaluator is not None)
 
         self.get_model_raw().eval()
+        self.monitor.reset_phase(
+            phase="valid",
+            global_step=self.global_step,
+        )
         val_losses: List[float] = []
         val_loss_dict_buffer: List[Dict[str, float]] = []
         pbar = tqdm(dataloader, desc=f"Epoch {epoch_idx} [Valid]")
 
         for batch in pbar:
+            batch_cases = self._as_case_list(batch)
+            case_contexts = {
+                case.global_idx: self.get_model_raw().prepare_case_loss_context(
+                    case
+                )
+                for case in batch_cases
+            }
             # --- loss ---
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.amp):
-                loss_dict, _ = self.get_model_raw().calculate_loss(batch_cases=batch)
+                loss_dict, _ = self.get_model_raw().calculate_loss(
+                    batch_cases=batch,
+                    case_contexts=case_contexts,
+                )
 
             val_losses.append(float(loss_dict["total_loss"].detach().item()))
             val_loss_dict_buffer.append({k: float(v.detach().item()) for k, v in loss_dict.items()})
@@ -465,6 +540,7 @@ class DRGVLM_PPTrainer:
                 output_case_dict = self.get_model_raw().generate_outputs(
                     batch_cases=batch,
                     max_new_tokens=self.max_new_tokens,
+                    case_contexts=case_contexts,
                 )
                 self.evaluator.update(
                     batch_cases=self._as_case_list(batch),
@@ -495,14 +571,312 @@ class DRGVLM_PPTrainer:
     # ------------------------------------------------------------------
     # train / valid
     # ------------------------------------------------------------------
+    def _record_validation_result(self, val_loss: float) -> bool:
+        """Update best-loss and patience state before any checkpoint is saved."""
+        if val_loss < self.best_val_loss:
+            self.best_val_loss = float(val_loss)
+            self.patience_counter = 0
+            return True
+        self.patience_counter += 1
+        return False
+
+    @staticmethod
+    def _checkpoint_artifact_paths(
+        checkpoint_dir: str,
+        weight_filename: str,
+        reference_name: Optional[str] = None,
+    ) -> Dict[str, str]:
+        stem = os.path.splitext(weight_filename)[0]
+        if reference_name is None:
+            reference_name = (
+                "best"
+                if stem == "best_model"
+                else "latest"
+                if stem == "latest_model"
+                else stem
+            )
+        return {
+            "reference_path": os.path.abspath(os.path.join(
+                checkpoint_dir,
+                "checkpoint_refs",
+                f"{reference_name}.json",
+            )),
+            "trainer_path": os.path.abspath(os.path.join(
+                checkpoint_dir,
+                f"[trainer]{weight_filename}",
+            )),
+            "lora_path": os.path.abspath(os.path.join(
+                checkpoint_dir,
+                weight_filename.replace(".pth", "_lora"),
+            )),
+        }
+
+    def _write_resume_source_manifest(self):
+        """Retain references to historical best artifacts in a new output dir."""
+        if self.resume_checkpoint_path is None:
+            return
+
+        source_checkpoint = os.path.abspath(self.resume_checkpoint_path)
+        source_dir = (
+            self.resume_checkpoint_root
+            if self.resume_checkpoint_root is not None
+            else os.path.dirname(source_checkpoint)
+        )
+        destination_dir = os.path.abspath(self.save_path)
+        if source_dir == destination_dir:
+            log_print(
+                "Resume uses the existing checkpoint directory; historical best "
+                "artifacts are preserved in place."
+            )
+            return
+
+        os.makedirs(destination_dir, exist_ok=True)
+        manifest: Dict[str, Any] = {
+            "resume_checkpoint_path": source_checkpoint,
+            "source_checkpoint_directory": source_dir,
+            "historical_best_val_loss": float(self.best_val_loss),
+            "historical_best_model": self._checkpoint_artifact_paths(
+                checkpoint_dir=source_dir,
+                weight_filename=self.weight_filename,
+                reference_name="best",
+            ),
+            "historical_metric_checkpoints": {
+                filename: {
+                    **self._checkpoint_artifact_paths(source_dir, filename),
+                    "state": state,
+                }
+                for filename, state in self.best_metric_values.items()
+            },
+        }
+
+        upstream_manifest_path = os.path.join(
+            source_dir,
+            "resume_source_checkpoints.json",
+        )
+        if os.path.isfile(upstream_manifest_path):
+            with open(upstream_manifest_path, "r", encoding="utf-8") as file:
+                manifest["upstream_resume_source"] = json.load(file)
+
+        manifest_path = os.path.join(
+            destination_dir,
+            "resume_source_checkpoints.json",
+        )
+        self._atomic_json_dump(manifest, manifest_path)
+        log_print(
+            "Resume output directory differs from its checkpoint source. "
+            f"Historical best references saved to: {manifest_path}"
+        )
+
+    def _prepare_run_checkpoint_artifacts(self, checkpoint_epoch_idx: int):
+        """Create only a truthful initial artifact; never rewrite best on resume."""
+        if checkpoint_epoch_idx < 0:
+            self.save_checkpoint(
+                epoch_idx=-1,
+                weight_filename="initial_model.pth",
+            )
+            return
+
+        self._write_resume_source_manifest()
+        log_print(
+            "Resume detected: no startup checkpoint was written, so existing "
+            "best/latest artifacts remain unchanged until an epoch completes."
+        )
+
+    @staticmethod
+    def _signature_differences(
+        expected: Any,
+        current: Any,
+        prefix: str = "",
+    ) -> List[str]:
+        differences: List[str] = []
+        if isinstance(expected, dict) and isinstance(current, dict):
+            for key in sorted(set(expected) | set(current)):
+                child_prefix = f"{prefix}.{key}" if prefix else str(key)
+                if key not in expected:
+                    differences.append(
+                        f"{child_prefix}: checkpoint=<missing>, "
+                        f"current={current[key]!r}"
+                    )
+                elif key not in current:
+                    differences.append(
+                        f"{child_prefix}: checkpoint={expected[key]!r}, "
+                        "current=<missing>"
+                    )
+                else:
+                    differences.extend(
+                        DRGVLM_PPTrainer._signature_differences(
+                            expected[key],
+                            current[key],
+                            child_prefix,
+                        )
+                    )
+            return differences
+        if expected != current:
+            differences.append(
+                f"{prefix}: checkpoint={expected!r}, current={current!r}"
+            )
+        return differences
+
+    @classmethod
+    def _build_static_resume_signature(
+        cls,
+        cfg: DRGVLM_baseConfig,
+    ) -> Dict[str, Any]:
+        def metadata_signature(path: Optional[str]) -> Optional[Dict[str, Any]]:
+            if not path:
+                return None
+            absolute_path = os.path.abspath(path)
+            return {
+                "sha256": cls._sha256_file(absolute_path),
+                "size_bytes": os.path.getsize(absolute_path),
+            }
+
+        return {
+            "signature_schema_version": 1,
+            "metadata": {
+                "train": metadata_signature(
+                    getattr(cfg, "train_metadata_path", None)
+                ),
+                "valid": metadata_signature(
+                    getattr(cfg, "valid_metadata_path", None)
+                ),
+            },
+            "dataset": {
+                "batch_size": getattr(cfg, "batch_size", None),
+                "dataloader_seed": getattr(cfg, "dataloader_seed", 42),
+                "input_img": getattr(cfg, "input_img", True),
+                "input_loc": getattr(cfg, "input_loc", True),
+                "level_key": getattr(cfg, "level_key", "main_info"),
+                "max_rois_per_case": getattr(
+                    cfg,
+                    "max_rois_per_case",
+                    None,
+                ),
+                "roi_sampling_mode": getattr(
+                    cfg,
+                    "roi_sampling_mode",
+                    "all",
+                ),
+                "use_max_roi_sampler": getattr(
+                    cfg,
+                    "use_max_roi_sampler",
+                    False,
+                ),
+                "max_rois_per_batch": getattr(
+                    cfg,
+                    "max_rois_per_batch",
+                    None,
+                ),
+                "DxItem_list": list(getattr(cfg, "DxItem_list", []) or []),
+            },
+            "optimization": {
+                "accumulation_steps": int(
+                    getattr(cfg, "accumulation_steps", 1)
+                ),
+                "total_steps": int(getattr(cfg, "total_steps", 0)),
+                "warmup_steps": int(getattr(cfg, "warmup_steps", 0)),
+            },
+            "model": {
+                "model_name": getattr(cfg, "model_name", None),
+                "training_mode": getattr(cfg, "training_mode", None),
+                "pp_num_gpus": getattr(cfg, "pp_num_gpus", None),
+                "pp_vision_split_index": getattr(
+                    cfg,
+                    "pp_vision_split_index",
+                    14,
+                ),
+                "lora_r": getattr(cfg, "lora_r", None),
+                "lora_alpha": getattr(cfg, "lora_alpha", None),
+                "lora_dropout": getattr(cfg, "lora_dropout", None),
+                "lora_target_modules": list(
+                    getattr(cfg, "lora_target_modules", []) or []
+                ),
+                "use_vision_lora": getattr(
+                    cfg,
+                    "use_vision_lora",
+                    False,
+                ),
+            },
+        }
+
+    def _prepare_resume_runtime(self, train_dataloader: DataLoader):
+        self._active_train_generator = getattr(
+            train_dataloader,
+            "generator",
+            None,
+        )
+        self.current_resume_signature = {
+            **self.resume_signature_static,
+            "runtime": {
+                "dataset_length": len(train_dataloader.dataset),
+                "dataloader_batches": len(train_dataloader),
+                "sampler_type": type(train_dataloader.sampler).__name__,
+                "batch_sampler_type": type(
+                    train_dataloader.batch_sampler
+                ).__name__,
+            },
+        }
+
+        is_continuation = (
+            self.checkpoint_epoch_idx is not None
+            and self.checkpoint_epoch_idx >= 0
+            and self.trainer_mode != "reTrain"
+        )
+        if not is_continuation:
+            return
+
+        if self._loaded_resume_signature:
+            differences = self._signature_differences(
+                self._loaded_resume_signature,
+                self.current_resume_signature,
+            )
+            if differences:
+                raise RuntimeError(
+                    "keepTrain resume signature mismatch; refusing to mix a "
+                    "checkpoint with changed data/training/model topology:\n- "
+                    + "\n- ".join(differences[:40])
+                )
+        else:
+            log_print(
+                "[WARN] Legacy checkpoint has no resume signature. Only the "
+                "available num_batches_per_epoch compatibility check can run."
+            )
+
+        if (
+            self.resume_num_batches_per_epoch is not None
+            and int(self.resume_num_batches_per_epoch)
+            != len(train_dataloader)
+        ):
+            raise RuntimeError(
+                "keepTrain DataLoader length mismatch: checkpoint="
+                f"{self.resume_num_batches_per_epoch}, "
+                f"current={len(train_dataloader)}."
+            )
+
+        if self._pending_train_generator_state is not None:
+            if self._active_train_generator is None:
+                raise RuntimeError(
+                    "Checkpoint contains a train DataLoader generator state, "
+                    "but the current DataLoader has no explicit generator."
+                )
+            self._active_train_generator.set_state(
+                self._pending_train_generator_state
+            )
+            log_print(
+                "Restored train DataLoader generator state for exact "
+                "sampler/worker-seed continuation."
+            )
+
     def train(self,
         train_dataloader: DataLoader,
         val_dataloader: DataLoader,
     ):
         log_print(f"Training started, total epochs {self.num_epochs}")
+        self._prepare_resume_runtime(train_dataloader)
         checkpoint_epoch_idx = self.checkpoint_epoch_idx if self.checkpoint_epoch_idx is not None else -1
-        self.save_checkpoint(epoch_idx=checkpoint_epoch_idx)
-        self.save_checkpoint(epoch_idx=checkpoint_epoch_idx, weight_filename="latest_model.pth")
+        self._prepare_run_checkpoint_artifacts(
+            checkpoint_epoch_idx=checkpoint_epoch_idx,
+        )
 
         for epoch_idx in range(checkpoint_epoch_idx + 1, self.num_epochs):
             train_loss = self.epoch_train(train_dataloader, epoch_idx=epoch_idx)
@@ -511,14 +885,16 @@ class DRGVLM_PPTrainer:
                 val_loss, metric_dict = self.epoch_validEval(val_dataloader, epoch_idx=epoch_idx)
             log_print(f"Epoch ({epoch_idx}/{self.num_epochs}): Train={train_loss:.4f}, Val={val_loss:.4f}")
 
-            new_best = val_loss < self.best_val_loss
-            if new_best:
-                self.best_val_loss = val_loss
-                self.save_checkpoint(epoch_idx=epoch_idx)
-                log_print(f"New best saved. Val Loss: {self.best_val_loss:.6f}")
-                self.patience_counter = 0
-            else:
-                self.patience_counter += 1
+            if val_dataloader is not None and val_loss == 0.0:
+                self.save_checkpoint(
+                    epoch_idx=epoch_idx,
+                    weight_filename=f"error_quick_checkpoint_epoch_{epoch_idx}.pth",
+                )
+                raise ValueError(f"Val loss=0.0 at epoch {epoch_idx}, quick checkpoint saved.")
+
+            new_best = False
+            if val_dataloader is not None:
+                new_best = self._record_validation_result(val_loss=val_loss)
 
             self._update_metric_checkpoints(
                 epoch_idx=epoch_idx,
@@ -526,12 +902,9 @@ class DRGVLM_PPTrainer:
                 metric_dict=metric_dict,
             )
 
-            if val_dataloader is not None and val_loss == 0.0:
-                self.save_checkpoint(
-                    epoch_idx=epoch_idx,
-                    weight_filename=f"error_quick_checkpoint_epoch_{epoch_idx}.pth",
-                )
-                raise ValueError(f"Val loss=0.0 at epoch {epoch_idx}, quick checkpoint saved.")
+            if new_best:
+                self.save_checkpoint(epoch_idx=epoch_idx)
+                log_print(f"New best saved. Val Loss: {self.best_val_loss:.6f}")
 
             self.metrics.epoch_summary(metric_dict=metric_dict, global_step=self.global_step)
 
@@ -558,6 +931,259 @@ class DRGVLM_PPTrainer:
     # ------------------------------------------------------------------
     # Checkpoint
     # ------------------------------------------------------------------
+    @staticmethod
+    def _atomic_json_dump(payload: Dict[str, Any], path: str):
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(path)}.",
+            suffix=".tmp",
+            dir=directory,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
+                json.dump(
+                    payload,
+                    file,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                file.write("\n")
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary_path, path)
+        except Exception:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+            raise
+
+    @staticmethod
+    def _sha256_file(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as file:
+            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @classmethod
+    def _artifact_hashes(cls, snapshot_path: str) -> Dict[str, str]:
+        hashes: Dict[str, str] = {}
+        for root, _, filenames in os.walk(snapshot_path):
+            for filename in sorted(filenames):
+                absolute_path = os.path.join(root, filename)
+                relative_path = os.path.relpath(
+                    absolute_path,
+                    snapshot_path,
+                )
+                if relative_path == "manifest.json":
+                    continue
+                hashes[relative_path] = cls._sha256_file(absolute_path)
+        return hashes
+
+    @staticmethod
+    def _capture_rng_state() -> Dict[str, Any]:
+        state: Dict[str, Any] = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda": None,
+        }
+        if torch.cuda.is_available():
+            state["torch_cuda"] = torch.cuda.get_rng_state_all()
+        return state
+
+    @staticmethod
+    def _restore_rng_state(state: Optional[Dict[str, Any]]):
+        if not isinstance(state, dict):
+            log_print(
+                "[WARN] Continuation checkpoint has no RNG state; exact "
+                "sample/augmentation replay cannot be guaranteed."
+            )
+            return
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch_cpu"])
+        saved_cuda = state.get("torch_cuda")
+        if saved_cuda is not None:
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "Checkpoint contains CUDA RNG state but CUDA is unavailable."
+                )
+            current_count = torch.cuda.device_count()
+            if len(saved_cuda) != current_count:
+                raise RuntimeError(
+                    "CUDA topology changed during keepTrain resume: "
+                    f"checkpoint GPUs={len(saved_cuda)}, current GPUs={current_count}."
+                )
+            torch.cuda.set_rng_state_all(saved_cuda)
+
+    def _reference_name(self, weight_filename: str) -> str:
+        stem = os.path.splitext(os.path.basename(weight_filename))[0]
+        if weight_filename == self.weight_filename or stem == "best_model":
+            return "best"
+        if stem == "latest_model":
+            return "latest"
+        return stem
+
+    def _checkpoint_state_cache_key(self, epoch_idx: int) -> str:
+        metric_losses = None
+        if self.metrics is not None:
+            metric_losses = getattr(
+                getattr(self.metrics, "train_loss_logger", None),
+                "losses",
+                None,
+            )
+        serializable = {
+            "epoch_idx": int(epoch_idx),
+            "global_step": int(getattr(self, "global_step", 0)),
+            "optimizer_step": int(getattr(self, "optimizer_step", 0)),
+            "best_val_loss": float(
+                getattr(self, "best_val_loss", float("inf"))
+            ),
+            "best_metric_values": getattr(self, "best_metric_values", {}),
+            "patience_counter": int(getattr(self, "patience_counter", 0)),
+            "metric_loss_count": (
+                len(metric_losses)
+                if isinstance(metric_losses, list)
+                else None
+            ),
+        }
+        encoded = json.dumps(
+            serializable,
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _checkpoint_payload(self, epoch_idx: int) -> Dict[str, Any]:
+        train_generator_state = None
+        if self._active_train_generator is not None:
+            train_generator_state = self._active_train_generator.get_state()
+        return {
+            "checkpoint_schema_version": 2,
+            "epoch_idx": epoch_idx,
+            "global_step": int(getattr(self, "global_step", 0)),
+            "optimizer_step": int(getattr(self, "optimizer_step", 0)),
+            "best_val_loss": float(
+                getattr(self, "best_val_loss", float("inf"))
+            ),
+            "best_metric_values": getattr(self, "best_metric_values", {}),
+            "patience_counter": int(getattr(self, "patience_counter", 0)),
+            "num_batches_per_epoch": self.num_batches_per_epoch,
+            "optimizer_state_dict": (
+                self.optimizer.state_dict()
+                if self.optimizer is not None
+                else None
+            ),
+            "scheduler_state_dict": (
+                self.scheduler.state_dict()
+                if self.scheduler is not None
+                else None
+            ),
+            "metrics": (
+                self.metrics.train_loss_logger.losses
+                if self.metrics is not None
+                else None
+            ),
+            "rng_state": self._capture_rng_state(),
+            "train_dataloader_generator_state": train_generator_state,
+            "resume_signature": self.current_resume_signature,
+        }
+
+    def _create_or_reuse_snapshot(self, epoch_idx: int) -> str:
+        cache_key = self._checkpoint_state_cache_key(epoch_idx)
+        if (
+            cache_key == self._snapshot_cache_key
+            and self._snapshot_cache_path is not None
+            and os.path.isdir(self._snapshot_cache_path)
+        ):
+            return self._snapshot_cache_path
+
+        artifact_root = os.path.join(
+            os.path.abspath(self.save_path),
+            "checkpoint_artifacts",
+        )
+        os.makedirs(artifact_root, exist_ok=True)
+        snapshot_id = (
+            f"epoch_{int(epoch_idx):06d}_"
+            f"step_{int(getattr(self, 'global_step', 0)):012d}_"
+            f"opt_{int(getattr(self, 'optimizer_step', 0)):012d}_"
+            f"{uuid.uuid4().hex[:8]}"
+        )
+        temporary_path = tempfile.mkdtemp(
+            prefix=f".{snapshot_id}.",
+            dir=artifact_root,
+        )
+        final_path = os.path.join(artifact_root, snapshot_id)
+        try:
+            trainer_path = os.path.join(temporary_path, "trainer.pth")
+            torch.save(self._checkpoint_payload(epoch_idx), trainer_path)
+            adapter_path = os.path.join(temporary_path, "adapter")
+            os.makedirs(adapter_path, exist_ok=True)
+            self.get_model_raw().save_lora_weights(path=adapter_path)
+
+            hashes = self._artifact_hashes(temporary_path)
+            manifest = {
+                "snapshot_schema_version": 1,
+                "snapshot_id": snapshot_id,
+                "created_at": datetime.now().astimezone().isoformat(),
+                "epoch_idx": int(epoch_idx),
+                "global_step": int(getattr(self, "global_step", 0)),
+                "optimizer_step": int(getattr(self, "optimizer_step", 0)),
+                "files": {
+                    relative_path: {
+                        "sha256": sha256,
+                        "size_bytes": os.path.getsize(
+                            os.path.join(temporary_path, relative_path)
+                        ),
+                    }
+                    for relative_path, sha256 in hashes.items()
+                },
+            }
+            self._atomic_json_dump(
+                manifest,
+                os.path.join(temporary_path, "manifest.json"),
+            )
+            os.replace(temporary_path, final_path)
+        except Exception:
+            if os.path.isdir(temporary_path):
+                shutil.rmtree(temporary_path)
+            raise
+
+        self._snapshot_cache_key = cache_key
+        self._snapshot_cache_path = final_path
+        log_print(f"Immutable checkpoint snapshot saved to: {final_path}")
+        return final_path
+
+    def _write_checkpoint_reference(
+        self,
+        snapshot_path: str,
+        weight_filename: str,
+    ) -> str:
+        reference_name = self._reference_name(weight_filename)
+        reference_path = os.path.join(
+            os.path.abspath(self.save_path),
+            "checkpoint_refs",
+            f"{reference_name}.json",
+        )
+        relative_snapshot = os.path.relpath(
+            snapshot_path,
+            os.path.abspath(self.save_path),
+        )
+        payload = {
+            "checkpoint_reference_schema_version": 1,
+            "reference_name": reference_name,
+            "updated_at": datetime.now().astimezone().isoformat(),
+            "requested_weight_filename": weight_filename,
+            "snapshot": relative_snapshot,
+            "trainer": os.path.join(relative_snapshot, "trainer.pth"),
+            "adapter": os.path.join(relative_snapshot, "adapter"),
+            "manifest": os.path.join(relative_snapshot, "manifest.json"),
+        }
+        self._atomic_json_dump(payload, reference_path)
+        return reference_path
+
     def save_checkpoint(self,
         epoch_idx: int,
         weight_filename: str = None,
@@ -569,55 +1195,133 @@ class DRGVLM_PPTrainer:
         self._assert_trainable_params_finite(context=checkpoint_context)
         self._assert_optimizer_state_finite(context=checkpoint_context)
 
-        checkpoint = {
-            "epoch_idx": epoch_idx,
-            "global_step": int(getattr(self, "global_step", 0)),
-            "optimizer_step": int(getattr(self, "optimizer_step", 0)),
-            "best_val_loss": float(getattr(self, "best_val_loss", float("inf"))),
-            "best_metric_values": getattr(self, "best_metric_values", {}),
-            "patience_counter": int(getattr(self, "patience_counter", 0)),
-            "num_batches_per_epoch": self.num_batches_per_epoch,
-            "optimizer_state_dict": self.optimizer.state_dict() if self.optimizer is not None else None,
-            "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler is not None else None,
-            "metrics": self.metrics.train_loss_logger.losses if self.metrics is not None else None,
-        }
-
         fn = weight_filename if weight_filename is not None else self.weight_filename
-        trainer_fn = f"[trainer]{fn}"
-        lora_dir = fn.replace(".pth", "_lora")
+        snapshot_path = self._create_or_reuse_snapshot(epoch_idx=epoch_idx)
+        reference_path = self._write_checkpoint_reference(
+            snapshot_path=snapshot_path,
+            weight_filename=fn,
+        )
+        log_print(
+            f"Checkpoint reference '{self._reference_name(fn)}' updated "
+            f"atomically: {reference_path}"
+        )
+        return reference_path
 
-        trainer_path = os.path.join(self.save_path, trainer_fn)
-        torch.save(checkpoint, trainer_path)
-        log_print(f"Trainer checkpoint saved to: {trainer_path}")
+    def _verify_snapshot(self, snapshot_path: str):
+        manifest_path = os.path.join(snapshot_path, "manifest.json")
+        if not os.path.isfile(manifest_path):
+            raise FileNotFoundError(
+                f"Snapshot manifest not found: {manifest_path}"
+            )
+        with open(manifest_path, "r", encoding="utf-8") as file:
+            manifest = json.load(file)
+        for relative_path, record in manifest.get("files", {}).items():
+            absolute_path = os.path.join(snapshot_path, relative_path)
+            if not os.path.isfile(absolute_path):
+                raise FileNotFoundError(
+                    f"Checkpoint artifact is missing: {absolute_path}"
+                )
+            actual_hash = self._sha256_file(absolute_path)
+            expected_hash = record.get("sha256")
+            if actual_hash != expected_hash:
+                raise RuntimeError(
+                    "Checkpoint integrity verification failed for "
+                    f"{absolute_path}: expected={expected_hash}, "
+                    f"actual={actual_hash}"
+                )
 
-        lora_path = os.path.join(self.save_path, lora_dir)
-        os.makedirs(lora_path, exist_ok=True)
-        self.get_model_raw().save_lora_weights(path=lora_path)
+    def _resolve_checkpoint_artifacts(
+        self,
+        path: str,
+    ) -> Tuple[str, str, str]:
+        requested_path = os.path.abspath(path)
+
+        if os.path.isfile(requested_path) and requested_path.endswith(".json"):
+            with open(requested_path, "r", encoding="utf-8") as file:
+                reference = json.load(file)
+            if "snapshot" not in reference:
+                raise ValueError(
+                    f"Not a DRGVLM checkpoint reference: {requested_path}"
+                )
+            reference_dir = os.path.dirname(requested_path)
+            checkpoint_root = (
+                os.path.dirname(reference_dir)
+                if os.path.basename(reference_dir) == "checkpoint_refs"
+                else reference_dir
+            )
+            snapshot_path = os.path.join(
+                checkpoint_root,
+                reference["snapshot"],
+            )
+            self._verify_snapshot(snapshot_path)
+            return (
+                os.path.join(snapshot_path, "trainer.pth"),
+                os.path.join(snapshot_path, "adapter"),
+                checkpoint_root,
+            )
+
+        if os.path.isdir(requested_path):
+            if os.path.isfile(os.path.join(requested_path, "manifest.json")):
+                self._verify_snapshot(requested_path)
+                checkpoint_root = os.path.dirname(
+                    os.path.dirname(requested_path)
+                )
+                return (
+                    os.path.join(requested_path, "trainer.pth"),
+                    os.path.join(requested_path, "adapter"),
+                    checkpoint_root,
+                )
+            raise ValueError(
+                "Checkpoint directory must be an immutable snapshot directory "
+                f"containing manifest.json, got: {requested_path}"
+            )
+
+        weight_filename = os.path.basename(requested_path)
+        checkpoint_root = os.path.dirname(requested_path)
+        reference_path = os.path.join(
+            checkpoint_root,
+            "checkpoint_refs",
+            f"{self._reference_name(weight_filename)}.json",
+        )
+        if os.path.isfile(reference_path):
+            return self._resolve_checkpoint_artifacts(reference_path)
+
+        # Backward-compatible reader for pre-schema-v2 flat checkpoints.
+        trainer_path = os.path.join(
+            checkpoint_root,
+            f"[trainer]{weight_filename}",
+        )
+        lora_dir = os.path.join(
+            checkpoint_root,
+            weight_filename.replace(".pth", "_lora"),
+        )
+        if not os.path.isfile(trainer_path):
+            raise FileNotFoundError(
+                "Neither a new checkpoint reference nor a legacy trainer "
+                f"checkpoint was found for: {requested_path}"
+            )
+        if not os.path.isdir(lora_dir):
+            raise FileNotFoundError(
+                f"LoRA directory not found for legacy checkpoint: {lora_dir}"
+            )
+        return trainer_path, lora_dir, checkpoint_root
 
     # ------------------------------------------------------------------
     # load_checkpoint
     # ------------------------------------------------------------------
     def load_checkpoint(self, path: str):
         log_print(f"Loading checkpoint from {path}")
-        weight_filename = os.path.basename(path)
-        trainer_path = os.path.join(os.path.dirname(path), f"[trainer]{weight_filename}")
-        lora_dir = os.path.join(
-            os.path.dirname(path),
-            weight_filename.replace(".pth", "_lora"),
+        self.resume_checkpoint_path = os.path.abspath(path)
+        trainer_path, lora_dir, checkpoint_root = (
+            self._resolve_checkpoint_artifacts(path)
         )
-
-        if not os.path.exists(trainer_path):
-            raise FileNotFoundError(f"Trainer checkpoint not found: {trainer_path}")
-
-        checkpoint = torch.load(trainer_path, map_location=self.device)
-
-        if os.path.isdir(lora_dir):
-            self.get_model_raw().load_lora_weights(path=lora_dir)
-        else:
-            raise FileNotFoundError(
-                f"LoRA directory not found for checkpoint: {lora_dir}. "
-                "Refusing to continue with randomly initialized adapters."
-            )
+        self.resume_checkpoint_root = checkpoint_root
+        checkpoint = torch.load(
+            trainer_path,
+            map_location=self.device,
+            weights_only=False,
+        )
+        self.get_model_raw().load_lora_weights(path=lora_dir)
 
         loaded_epoch_idx = int(checkpoint.get("epoch_idx", -1))
         self.checkpoint_epoch_idx = loaded_epoch_idx if self.trainer_mode != "reTrain" else -1
@@ -662,6 +1366,16 @@ class DRGVLM_PPTrainer:
             self.resume_num_batches_per_epoch = checkpoint.get(
                 "num_batches_per_epoch", None
             )
+            self._loaded_resume_signature = checkpoint.get(
+                "resume_signature"
+            )
+            self._pending_train_generator_state = checkpoint.get(
+                "train_dataloader_generator_state"
+            )
+            self._restore_rng_state(checkpoint.get("rng_state"))
+            self._migrate_clinical_metric_state(
+                checkpoint_dir=checkpoint_root,
+            )
             log_print(
                 "Continuation mode: restored LoRA, optimizer, scheduler, epoch, "
                 "steps, best metrics, and patience state."
@@ -682,6 +1396,81 @@ class DRGVLM_PPTrainer:
         except (TypeError, ValueError):
             return None
         return value if np.isfinite(value) else None
+
+    def _migrate_clinical_metric_state(self, checkpoint_dir: str):
+        """Migrate legacy clinical scores without mismatching saved adapters."""
+        filename = "best_clinical_composite.pth"
+        previous = self.best_metric_values.get(filename)
+        if not isinstance(previous, dict):
+            return
+        if self.evaluator is None:
+            raise RuntimeError(
+                "Cannot migrate clinical metric state without an evaluator."
+            )
+
+        current_version = int(
+            self.evaluator.CLINICAL_METRIC_SCHEMA_VERSION
+        )
+        previous_version = previous.get("metric_schema_version")
+        if previous_version is not None and int(previous_version) == current_version:
+            return
+
+        eval_paths = sorted(glob.glob(os.path.join(
+            checkpoint_dir,
+            "eval_results*.json",
+        )))
+        if not eval_paths:
+            raise RuntimeError(
+                "The checkpoint contains a legacy clinical best score, but no "
+                "saved eval_results JSON files are available for schema migration."
+            )
+
+        recomputed = []
+        for eval_path in eval_paths:
+            with open(eval_path, "r", encoding="utf-8") as file:
+                payload = json.load(file)
+            metrics = self.evaluator.recompute_saved_cases(
+                stored_cases=payload.get("cases", []),
+            )
+            score = self._finite_float(metrics.get("clinical_macro_score"))
+            if score is None:
+                continue
+            recomputed.append({
+                "score": score,
+                "epoch_idx": int(payload["epoch_idx"]),
+                "metrics": metrics,
+                "eval_path": os.path.abspath(eval_path),
+            })
+
+        if not recomputed:
+            raise RuntimeError(
+                "Unable to recompute any finite clinical score from saved "
+                "evaluation results."
+            )
+        migrated_best = max(recomputed, key=lambda item: item["score"])
+        previous_epoch = int(previous.get("epoch_idx", -1))
+        if migrated_best["epoch_idx"] != previous_epoch:
+            raise RuntimeError(
+                "Clinical metric schema migration changed the historical best "
+                f"epoch from {previous_epoch} to {migrated_best['epoch_idx']}. "
+                "The existing best_clinical_composite adapter cannot be relabeled "
+                "safely; restore or create an adapter for the recomputed epoch."
+            )
+
+        previous["legacy_score"] = previous.get("score")
+        previous["score"] = float(migrated_best["score"])
+        previous["metric_schema_version"] = current_version
+        previous["metrics"] = {
+            key: float(value)
+            for key, value in migrated_best["metrics"].items()
+            if self._finite_float(value) is not None
+        }
+        previous["metric_migration_eval_path"] = migrated_best["eval_path"]
+        log_print(
+            "Migrated best clinical metric state to schema "
+            f"v{current_version}: epoch={previous_epoch}, "
+            f"score={previous['score']:.6f}."
+        )
 
     def _metric_checkpoint_scores(self,
         metric_dict: Dict[str, Any],
@@ -726,15 +1515,38 @@ class DRGVLM_PPTrainer:
         for fn, score in scores.items():
             prev = self.best_metric_values.get(fn, {})
             prev_score = self._finite_float(prev.get("score")) if isinstance(prev, dict) else None
+
+            metric_schema_version = None
+            if fn == "best_clinical_composite.pth":
+                raw_version = metric_dict.get("clinical_metric_schema_version")
+                if raw_version is None:
+                    raise RuntimeError(
+                        "clinical_macro_score is missing its metric schema version."
+                    )
+                metric_schema_version = int(raw_version)
+                if prev_score is not None:
+                    previous_version = prev.get("metric_schema_version")
+                    if (
+                        previous_version is None
+                        or int(previous_version) != metric_schema_version
+                    ):
+                        raise RuntimeError(
+                            "Refusing to compare clinical checkpoint scores from "
+                            "different metric schema versions."
+                        )
+
             if prev_score is not None and score <= prev_score:
                 continue
-            self.best_metric_values[fn] = {
+            new_state = {
                 "score": float(score),
                 "epoch_idx": int(epoch_idx),
                 "global_step": int(getattr(self, "global_step", 0)),
                 "val_loss": float(val_loss_value) if val_loss_value is not None else None,
                 "metrics": {k: float(v) for k, v in metric_dict.items() if self._finite_float(v) is not None},
             }
+            if metric_schema_version is not None:
+                new_state["metric_schema_version"] = metric_schema_version
+            self.best_metric_values[fn] = new_state
             improved.append(fn)
 
         for fn in improved:
@@ -746,8 +1558,10 @@ class DRGVLM_PPTrainer:
 
         if improved:
             manifest_path = os.path.join(self.save_path, "best_metric_checkpoints.json")
-            with open(manifest_path, "w", encoding="utf-8") as f:
-                json.dump(self.best_metric_values, f, ensure_ascii=False, indent=2, sort_keys=True)
+            self._atomic_json_dump(
+                self.best_metric_values,
+                manifest_path,
+            )
 
     # ------------------------------------------------------------------
     # from_config
@@ -780,11 +1594,37 @@ class DRGVLM_PPTrainer:
         cfg.total_steps = math.ceil(
             cfg.num_batchs_per_epoch / max(1, cfg.accumulation_steps)
         ) * cfg.num_epochs
-        cfg.warmup_steps = int(
-            min(cfg.warmup_ratio * cfg.total_steps, cfg.max_warmup_steps)
-            if cfg.warmup_steps is None or cfg.warmup_steps > (cfg.warmup_ratio * cfg.total_steps)
-            else cfg.warmup_steps
-        )
+        automatic_warmup_steps = int(min(
+            cfg.warmup_ratio * cfg.total_steps,
+            cfg.max_warmup_steps,
+        ))
+        if cfg.warmup_steps is None:
+            cfg.warmup_steps = automatic_warmup_steps
+        else:
+            cfg.warmup_steps = int(cfg.warmup_steps)
+            if cfg.warmup_steps < 0:
+                raise ValueError(
+                    "Explicit warmup_steps must be non-negative, got "
+                    f"{cfg.warmup_steps}."
+                )
+            warning_reasons = []
+            if cfg.warmup_steps > automatic_warmup_steps:
+                warning_reasons.append(
+                    f"automatic recommendation {automatic_warmup_steps}"
+                )
+            if cfg.warmup_steps > cfg.max_warmup_steps:
+                warning_reasons.append(
+                    f"max_warmup_steps {cfg.max_warmup_steps}"
+                )
+            if cfg.warmup_steps > cfg.total_steps:
+                warning_reasons.append(f"total_steps {cfg.total_steps}")
+            if warning_reasons:
+                log_print(
+                    "[WARN] Explicit warmup_steps="
+                    f"{cfg.warmup_steps} exceeds "
+                    + ", ".join(warning_reasons)
+                    + "; preserving the explicit value."
+                )
         log_print(_debug_print("Total Steps", cfg.total_steps))
         log_print(_debug_print("Warmup Steps", cfg.warmup_steps))
 
@@ -797,19 +1637,14 @@ class DRGVLM_PPTrainer:
         trainer.init_metrics()
         evaluator = DRGVLMEvaluator.from_config(cfg=cfg)
         trainer.init_evaluator(evaluator=evaluator)
+        trainer.resume_signature_static = (
+            trainer._build_static_resume_signature(cfg)
+        )
 
         if checkpoint_path:
             trainer.load_checkpoint(path=checkpoint_path)
 
         return trainer
-
-
-
-
-
-
-
-
 
 
 

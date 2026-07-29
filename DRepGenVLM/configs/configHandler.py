@@ -31,6 +31,28 @@ def _parse_optional_bool(value):
 
 
 class ConfigHandler:
+    @staticmethod
+    def _checkpoint_root(path: str) -> str:
+        parent = os.path.dirname(os.path.abspath(path))
+        if os.path.basename(parent) == "checkpoint_refs":
+            return os.path.dirname(parent)
+        return parent
+
+    @staticmethod
+    def _checkpoint_reference_or_legacy(
+        checkpoint_dir: str,
+        reference_name: str,
+        legacy_filename: str,
+    ) -> str:
+        reference_path = os.path.join(
+            checkpoint_dir,
+            "checkpoint_refs",
+            f"{reference_name}.json",
+        )
+        if os.path.isfile(reference_path):
+            return reference_path
+        return os.path.join(checkpoint_dir, legacy_filename)
+
     def __init__(self, 
         cfg, 
         checkpoint_path: str = None,
@@ -54,7 +76,7 @@ class ConfigHandler:
             raise ValueError("--use-this-dir is only supported with --latest-checkpoint-path, not --best-checkpoint-path.")
 
         if self.use_this_dir and self.checkpoint_path is not None:
-            self.cfg.save_path = os.path.dirname(self.checkpoint_path)
+            self.cfg.save_path = self._checkpoint_root(self.checkpoint_path)
             os.makedirs(self.cfg.save_path, exist_ok=True)
             log_print(f"Continue updating in checkpoint directory: {self.cfg.save_path}")
         elif getattr(self.cfg, 'save_path', None) is None or self.checkpoint_path is not None:
@@ -109,9 +131,13 @@ class ConfigHandler:
         if use_this_dir and latest_checkpoint_path is None:
             log_print("[WARN] --use-this-dir was provided without --latest-checkpoint-path; it will be ignored.")
 
-        if cfg_path is None and (best_checkpoint_path is not None or latest_checkpoint_path is not None):
-            checkpoint_path = best_checkpoint_path if best_checkpoint_path is not None else latest_checkpoint_path
-            cfg_path = os.path.join(checkpoint_path, "config.json")
+        checkpoint_dir = (
+            best_checkpoint_path
+            if best_checkpoint_path is not None
+            else latest_checkpoint_path
+        )
+        if cfg_path is None and checkpoint_dir is not None:
+            cfg_path = os.path.join(checkpoint_dir, "config.json")
             log_print(f"Inferring cfg_path from checkpoint_path: {cfg_path}")
 
         cfg = DRGVLM_baseConfig.load(
@@ -121,10 +147,28 @@ class ConfigHandler:
 
         if best_checkpoint_path is not None:
             checkpoint_type = "best"
-            checkpoint_path = os.path.join(checkpoint_path, cfg.weight_filename if weight_filename is None else weight_filename)
+            selected_filename = (
+                cfg.weight_filename
+                if weight_filename is None
+                else weight_filename
+            )
+            reference_name = (
+                "best"
+                if selected_filename == cfg.weight_filename
+                else os.path.splitext(selected_filename)[0]
+            )
+            checkpoint_path = cls._checkpoint_reference_or_legacy(
+                checkpoint_dir=best_checkpoint_path,
+                reference_name=reference_name,
+                legacy_filename=selected_filename,
+            )
         elif latest_checkpoint_path is not None:
             checkpoint_type = "latest"
-            checkpoint_path = os.path.join(checkpoint_path, "latest_model.pth")
+            checkpoint_path = cls._checkpoint_reference_or_legacy(
+                checkpoint_dir=latest_checkpoint_path,
+                reference_name="latest",
+                legacy_filename="latest_model.pth",
+            )
         else:
             checkpoint_type = None
             checkpoint_path = None
@@ -138,8 +182,6 @@ class ConfigHandler:
         )
 
         return cfg_handler
-
-
 
 
 

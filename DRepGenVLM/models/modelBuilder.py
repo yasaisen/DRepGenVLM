@@ -8,129 +8,33 @@
  last modified in 2602011121
 """
 
-
-# =====================================================================
-# Monkey Patch to intercept flash_attn for head_dim > 256 (Bidirectional)
-# =====================================================================
-try:
-    import flash_attn_interface
-    import functools
-    import math
-    import torch
-    
-    class CustomBlockAttention(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, q, k, v, block_size=1024):
-            device = q.device
-            dtype = q.dtype
-            B, H, Sq, D = q.shape
-            _, _, Sk, _ = k.shape
-            scale = 1.0 / math.sqrt(D)
-            out = torch.zeros_like(q)
-            lse = torch.empty((B, H, Sq), device=device, dtype=torch.float32)
-            kt = k.transpose(-2, -1)
-            for i in range(0, Sq, block_size):
-                end_i = min(i + block_size, Sq)
-                q_block = q[:, :, i:end_i, :]
-                scores = torch.matmul(q_block, kt) * scale
-                max_scores = torch.max(scores, dim=-1, keepdim=True)[0]
-                exp_scores = torch.exp(scores - max_scores)
-                sum_exp = torch.sum(exp_scores, dim=-1, keepdim=True)
-                out_block = torch.matmul(exp_scores, v) / (sum_exp + 1e-9)
-                out[:, :, i:end_i, :] = out_block.to(dtype)
-                lse_block = max_scores + torch.log(sum_exp + 1e-9)
-                lse[:, :, i:end_i] = lse_block.squeeze(-1).to(torch.float32)
-            ctx.save_for_backward(q, k, v, out, lse)
-            ctx.block_size = block_size
-            ctx.scale = scale
-            return out
-
-        @staticmethod
-        def backward(ctx, grad_out):
-            q, k, v, out, lse = ctx.saved_tensors
-            block_size = ctx.block_size
-            scale = ctx.scale
-            dtype = q.dtype
-            B, H, Sq, D = q.shape
-            grad_q = torch.zeros_like(q)
-            grad_k = torch.zeros_like(k)
-            grad_v = torch.zeros_like(v)
-            D_val = torch.sum(grad_out * out, dim=-1, keepdim=True)
-            kt = k.transpose(-2, -1)
-            vt = v.transpose(-2, -1)
-            for i in range(0, Sq, block_size):
-                end_i = min(i + block_size, Sq)
-                q_block = q[:, :, i:end_i, :]
-                grad_out_block = grad_out[:, :, i:end_i, :]
-                D_block = D_val[:, :, i:end_i, :]
-                lse_block = lse[:, :, i:end_i].unsqueeze(-1)
-                scores = torch.matmul(q_block, kt) * scale
-                p_block = torch.exp(scores - lse_block).to(dtype)
-                grad_v += torch.matmul(p_block.transpose(-2, -1), grad_out_block)
-                dp_block = torch.matmul(grad_out_block, vt) - D_block
-                ds_block = (scale * p_block * dp_block).to(dtype)
-                grad_q[:, :, i:end_i, :] = torch.matmul(ds_block, k)
-                grad_k += torch.matmul(ds_block.transpose(-2, -1), q_block)
-            return grad_q, grad_k, grad_v, None
-
-    def make_wrapper(orig_func, name):
-        @functools.wraps(orig_func)
-        def wrapper(*args, **kwargs):
-            q = args[0] if len(args) > 0 else kwargs.get("q")
-            if q is not None and q.shape[-1] > 256:
-                k = args[1] if len(args) > 1 else kwargs.get("k")
-                v = args[2] if len(args) > 2 else kwargs.get("v")
-                if name == "flash_attn_func":
-                    q_t = q.transpose(1, 2)
-                    k_t = k.transpose(1, 2)
-                    v_t = v.transpose(1, 2)
-                    if k_t.shape[1] != q_t.shape[1]:
-                        n_rep = q_t.shape[1] // k_t.shape[1]
-                        k_t = k_t.repeat_interleave(n_rep, dim=1).contiguous()
-                        v_t = v_t.repeat_interleave(n_rep, dim=1).contiguous()
-                    out_t = CustomBlockAttention.apply(q_t, k_t, v_t, 1024)
-                    out = out_t.transpose(1, 2).contiguous()
-                    # print(f"[FA3 Patch] Intercepted {name} (head_dim={q.shape[-1]} > 256), used Bidirectional CustomBlockAttention", flush=True)
-                    return out
-                elif name == "flash_attn_varlen_func":
-                    cu_seqlens_q = args[3] if len(args) > 3 else kwargs.get("cu_seqlens_q")
-                    cu_seqlens_k = args[4] if len(args) > 4 else kwargs.get("cu_seqlens_k")
-                    out_list = []
-                    for i in range(len(cu_seqlens_q) - 1):
-                        start_q, end_q = cu_seqlens_q[i], cu_seqlens_q[i+1]
-                        start_k, end_k = cu_seqlens_k[i], cu_seqlens_k[i+1]
-                        qi = q[start_q:end_q].unsqueeze(0).transpose(1, 2)
-                        ki = k[start_k:end_k].unsqueeze(0).transpose(1, 2)
-                        vi = v[start_k:end_k].unsqueeze(0).transpose(1, 2)
-                        if ki.shape[1] != qi.shape[1]:
-                            n_rep = qi.shape[1] // ki.shape[1]
-                            ki = ki.repeat_interleave(n_rep, dim=1).contiguous()
-                            vi = vi.repeat_interleave(n_rep, dim=1).contiguous()
-                        outi = CustomBlockAttention.apply(qi, ki, vi, 1024)
-                        out_list.append(outi.transpose(1, 2).squeeze(0))
-                    out = torch.cat(out_list, dim=0)
-                    # print(f"[FA3 Patch] Intercepted {name} (head_dim={q.shape[-1]} > 256), used Bidirectional CustomBlockAttention", flush=True)
-                    return out
-            return orig_func(*args, **kwargs)
-        return wrapper
-
-    flash_attn_interface.flash_attn_func = make_wrapper(flash_attn_interface.flash_attn_func, "flash_attn_func")
-    flash_attn_interface.flash_attn_varlen_func = make_wrapper(flash_attn_interface.flash_attn_varlen_func, "flash_attn_varlen_func")
-    if hasattr(flash_attn_interface, "flash_attn_with_kvcache"):
-        flash_attn_interface.flash_attn_with_kvcache = make_wrapper(flash_attn_interface.flash_attn_with_kvcache, "flash_attn_with_kvcache")
-    print("[FA3 Patch] Successfully installed Bidirectional CustomBlockAttention monkey patch for head_dim > 256", flush=True)
-except ModuleNotFoundError as e:
-    # flash_attn_interface is optional; SDPA configurations do not need this
-    # compatibility patch and should not emit an alarming startup warning.
-    if e.name != "flash_attn_interface":
-        print(f"[FA3 Patch Warning] Failed to apply CustomBlockAttention monkey patch: {e}", flush=True)
-except Exception as e:
-    print(f"[FA3 Patch Warning] Failed to apply CustomBlockAttention monkey patch: {e}", flush=True)
-# =====================================================================
-
-
 import os
 import torch
+
+from .flashAttentionPatch import install_large_head_flash_attention_patch
+
+
+# Optional compatibility fallback for FA3 interfaces that reject head_dim > 256.
+# The fallback honors causal/window semantics and refuses unsupported options
+# instead of silently changing attention behavior.
+try:
+    import flash_attn_interface
+
+    install_large_head_flash_attention_patch(flash_attn_interface)
+except ModuleNotFoundError as error:
+    # SDPA configurations do not require flash_attn_interface.
+    if error.name != "flash_attn_interface":
+        print(
+            "[FA3 Patch Warning] Failed to install large-head causal fallback: "
+            f"{error}",
+            flush=True,
+        )
+except Exception as error:
+    print(
+        "[FA3 Patch Warning] Failed to install large-head causal fallback: "
+        f"{error}",
+        flush=True,
+    )
 
 
 from ..common.utils import log_print, _debug_print, load_json_data, _print_model_summary
@@ -289,11 +193,15 @@ class modelBuilder:
             visual_encoder.to(device)
         return visual_encoder.eval()
 
+
+
     @staticmethod
     def _build_manual_pp_device_map(
-        model_path: str,
+        config: object,
         model_name: str,
-        num_gpus: int,
+        num_gpus: int = None,
+        project_name: str = None,
+        vision_split_index: int = None,
     ) -> dict:
         """
         Build a layer-to-device mapping dict for Pipeline Parallelism.
@@ -305,6 +213,8 @@ class modelBuilder:
           cuda:0 carries vision/projector/embed/lm_head and is always de-loaded.
           For CLEE GemmaX base-model paths without a runtime lm_head, cuda:N-1
           is no longer specially de-loaded and receives a regular layer share.
+          When exactly 8 GPUs are requested, cuda:0 carries no text layers;
+          all text transformer layers are balanced across cuda:1..cuda:7.
         * lm_head stays on cuda:0 because its weight is tied to embed_tokens.
 
         Supported model families
@@ -323,18 +233,140 @@ class modelBuilder:
 
         Falls back to the string "auto" for unknown models.
         """
-        from transformers import AutoConfig
-        log_print(f"[PP] Building manual device_map for '{model_name}' with {num_gpus} GPU(s)...")
 
-        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        if num_gpus is not None and num_gpus > 1:
+            log_print(f"[PP] Building manual device_map for '{model_name}' with {num_gpus} GPU(s)...")
+        else:
+            log_print(f"[PP] Invalid num_gpus={num_gpus} for '{model_name}', falling back to device_map='auto'.")
+            return "auto"
+
         try:
-            num_text_layers = config.text_config.num_hidden_layers
+            text_config = config.text_config if hasattr(config, "text_config") else config
+            num_text_layers = text_config.num_hidden_layers
         except AttributeError:
+            log_print(f"[PP] Cannot determine num_hidden_layers for '{model_name}', falling back to device_map='auto'.")
+            return "auto"
+
+        if vision_split_index is not None:
             try:
-                num_text_layers = config.num_hidden_layers
+                vision_config = getattr(config, "vision_config", None)
+                num_vision_layers = getattr(vision_config, "num_hidden_layers", None)
             except AttributeError:
-                log_print(f"[PP] Cannot determine num_hidden_layers for '{model_name}', falling back to device_map='auto'.")
-                return "auto"
+                raise ValueError(f"Cannot determine num_hidden_layers for vision_config in '{model_name}'.")
+            if not 0 <= int(vision_split_index) < int(num_vision_layers):
+                raise ValueError(
+                    "pp_vision_split_index must be inside the vision "
+                    f"layer range [0, {num_vision_layers}), got "
+                    f"{vision_split_index}."
+                )
+
+
+        if project_name in ["DRGVLM", "CLEE"] and model_name in ["medgemma-1.5-4b-it", "gemma-4-E4B-it"]:
+            text_layer_fmt = "model.language_model.layers.{}"
+            device_map: dict = {}
+            if num_gpus < 8:
+                if project_name == "CLEE" and model_name == "medgemma-1.5-4b-it":
+                    device_map.update({
+                        "model.vision_tower": "cuda:0",
+                        "model.multi_modal_projector": "cuda:0",
+                        "model.language_model.embed_tokens": "cuda:0",
+                        "model.language_model.norm": "cuda:0",
+                        "lm_head": "cuda:0",
+                    })
+                elif project_name == "CLEE" and model_name == "gemma-4-E4B-it":
+                    device_map.update({
+                        "vision_tower": "cuda:0",
+                        "embed_vision": "cuda:0",
+                        "language_model.embed_tokens": "cuda:0",
+                        "language_model.embed_tokens_per_layer": "cuda:0",
+                        "language_model.per_layer_model_projection": "cuda:0",
+                    })
+                elif project_name == "DRGVLM" and model_name == "medgemma-1.5-4b-it":
+                    device_map.update({
+                        "model.vision_tower": "cuda:0",
+                        "model.multi_modal_projector": "cuda:0",
+                        "model.language_model.embed_tokens": "cuda:0",
+                        "model.language_model.norm": "cuda:0",
+                        "lm_head": "cuda:0",
+                    })
+                else:
+                    raise ValueError(
+                        f"Unsupported project_name/model_name combination: {project_name}/{model_name}"
+                    )
+                text_gpu_indices = list(range(1, num_gpus))
+            elif num_gpus >= 6:
+                if project_name == "CLEE" and model_name == "medgemma-1.5-4b-it":
+                    device_map["model.vision_tower.embeddings"] = "cuda:0"
+                    for layer_idx in range(int(num_vision_layers)):
+                        device_map[f"model.vision_tower.encoder.layers.{layer_idx}"] = "cuda:0" if layer_idx < vision_split_index else "cuda:1"
+                    device_map.update({
+                        "model.vision_tower.post_layernorm": "cuda:1",
+                        "model.multi_modal_projector": "cuda:1",
+                        "model.language_model.embed_tokens": "cuda:1",
+                        "model.language_model.norm": "cuda:1",
+                        "lm_head": "cuda:1",
+                    })
+                elif project_name == "CLEE" and model_name == "gemma-4-E4B-it":
+                    device_map["vision_tower.patch_embedder"] = "cuda:0"
+                    for layer_idx in range(int(num_vision_layers)):
+                        device_map[f"vision_tower.encoder.layers.{layer_idx}"] = "cuda:0" if layer_idx < vision_split_index else "cuda:1"
+                    device_map.update({
+                        "embed_vision": "cuda:1",
+                        "language_model.embed_tokens": "cuda:1",
+                        "language_model.embed_tokens_per_layer": "cuda:1",
+                        "language_model.per_layer_model_projection": "cuda:1",
+                    })
+                elif project_name == "DRGVLM" and model_name == "medgemma-1.5-4b-it":
+                    device_map["model.vision_tower.embeddings"] = "cuda:0"
+                    for layer_idx in range(int(num_vision_layers)):
+                        device_map[f"model.vision_tower.encoder.layers.{layer_idx}"] = "cuda:0" if layer_idx < vision_split_index else "cuda:1"
+                    device_map.update({
+                        "model.vision_tower.post_layernorm": "cuda:1",
+                        "model.multi_modal_projector": "cuda:1",
+                        "model.language_model.embed_tokens": "cuda:1",
+                        "model.language_model.norm": "cuda:1",
+                        "lm_head": "cuda:1",
+                    })
+                else:
+                    raise ValueError(
+                        f"Unsupported project_name/model_name combination: {project_name}/{model_name}"
+                    )
+                text_gpu_indices = list(range(2, num_gpus))
+            else:
+                raise ValueError(
+                    f"The {project_name} PP policy currently supports 1-8 "
+                    f"GPUs, got {num_gpus}."
+                )
+
+            base_layers = num_text_layers // len(text_gpu_indices)
+            remainder = num_text_layers % len(text_gpu_indices)
+            layers_on_gpu = [0 for _ in range(num_gpus)]
+            layer_idx = 0
+            for offset, gpu_idx in enumerate(text_gpu_indices):
+                # Put remainder blocks on later GPUs.  For 34 text layers this
+                # gives [0, 11, 11, 12] on 4 GPUs and
+                # [0, 0, 5, 5, 6, 6, 6, 6] on 8 GPUs.
+                gets_remainder = (
+                    remainder > 0
+                    and offset >= len(text_gpu_indices) - remainder
+                )
+                count = base_layers + (1 if gets_remainder else 0)
+                layers_on_gpu[gpu_idx] = count
+                for _ in range(count):
+                    device_map[text_layer_fmt.format(layer_idx)] = (
+                        f"cuda:{gpu_idx}"
+                    )
+                    layer_idx += 1
+
+            log_print(
+                "[PP] Manual Gemma device_map built: "
+                f"text_layers={num_text_layers}, "
+                f"layers_on_gpu={layers_on_gpu}, "
+                f"vision_split_index="
+                f"{vision_split_index if num_gpus == 8 else 'n/a'}"
+            )
+            log_print(f"[PP] device_map = {device_map}")
+            return device_map
 
         # Strategy: explicit per-module enumeration (NO catch-all)
         # ---------------------------------------------------------------
@@ -463,6 +495,16 @@ class modelBuilder:
             else:
                 cuda0_layers = max(1, round(num_text_layers / 3)) if num_text_layers >= num_gpus else 1
             layers_on_gpu = [cuda0_layers, num_text_layers - cuda0_layers]
+        elif num_gpus == 8:
+            other_gpu_count = num_gpus - 1
+            base_other_layers = num_text_layers // other_gpu_count
+            remainder_other_layers = num_text_layers % other_gpu_count
+
+            layers_on_gpu = [0]
+            for gpu_offset in range(other_gpu_count):
+                gets_remainder = gpu_offset >= other_gpu_count - remainder_other_layers
+                n_layers = base_other_layers + (1 if gets_remainder else 0)
+                layers_on_gpu.append(n_layers)
         else:
             if num_text_layers < num_gpus:
                 layers_on_gpu = [1 if gpu_idx < num_text_layers else 0 for gpu_idx in range(num_gpus)]
@@ -525,22 +567,21 @@ class modelBuilder:
         config_dict: dict = None,
         pp_num_gpus: int = None,
     ):
-        """
-        pp_num_gpus: if not None and > 1, build a manual Pipeline Parallelism
-                     device_map that splits the model across that many GPUs.
-                     Pass None (default) to keep the original device_map='auto'.
-        """
         if model_name not in self.weight_mapping_dict.keys():
             raise ValueError(f'Model name {model_name} not found in self.weight_mapping_dict')
 
-        # Build PP device_map once (shared across all branches below)
-        _pp_device_map = None
-        if pp_num_gpus is not None and pp_num_gpus > 1:
-            _pp_device_map = self._build_manual_pp_device_map(
-                model_path=os.path.join(self.weight_path, self.weight_mapping_dict[model_name]['checkpoint_path']),
-                model_name=model_name,
-                num_gpus=pp_num_gpus,
-            )
+        _config_dict = config_dict if config_dict is not None else {}
+        model_path = os.path.join(self.weight_path, self.weight_mapping_dict[model_name]['checkpoint_path'])
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
+        _pp_device_map = self._build_manual_pp_device_map(
+            config=config,
+            model_name=model_name,
+            num_gpus=pp_num_gpus,
+            project_name=project_name,
+            vision_split_index=_config_dict.get("pp_vision_split_index", None),
+        )
 
         model = None
         max_seq_len = None
@@ -557,11 +598,10 @@ class modelBuilder:
                 }
             ]
 
-            use_bidirectional_attention = config_dict.get('use_bidirectional_attention', None) if config_dict is not None else None
-            attn_implementation = config_dict.get('attn_implementation', "sdpa") if config_dict is not None else "sdpa"
+            use_bidirectional_attention = _config_dict.get('use_bidirectional_attention', None)
+            attn_implementation = _config_dict.get('attn_implementation', "sdpa")
             config_modifier = None
             return_model_attr = None
-
             if model_name == 'medgemma-1.5-4b-it':
                 from transformers import Gemma3ForConditionalGeneration as classModel
                 # Local MedGemma 1.5 checkpoints are keyed for the outer
@@ -576,13 +616,12 @@ class modelBuilder:
                 # audio_tower/embed_audio from being constructed or dispatched.
                 if isinstance(use_bidirectional_attention, bool):
                     use_bidirectional_attention = 'all' if use_bidirectional_attention else None
-
                 def config_modifier(config):
                     config.audio_config = None
                     return config
 
             model, processor, generate_func = self._bulid_language_model(
-                model_path=os.path.join(self.weight_path, self.weight_mapping_dict[model_name]['checkpoint_path']),
+                model_path=model_path,
                 load_visual_processor=load_visual_processor,
                 torch_dtype=torch_dtype,
                 classTokenizer=classTokenizer,
@@ -591,7 +630,7 @@ class modelBuilder:
                 set_pad_token_as_eos=True,
                 use_bidirectional_attention=use_bidirectional_attention,
                 attn_implementation=attn_implementation, 
-                pp_device_map=_pp_device_map,
+                device_map=_pp_device_map,
                 config_modifier=config_modifier,
                 return_model_attr=return_model_attr,
             )
@@ -613,11 +652,10 @@ class modelBuilder:
                     ]
                 }
             ]
-            use_bidirectional_attention = config_dict.get('use_bidirectional_attention', None) if config_dict is not None else None
-            attn_implementation = config_dict.get('attn_implementation', "sdpa") if config_dict is not None else "sdpa"
-            attn_implementation = attn_implementation or "sdpa"
+            use_bidirectional_attention = _config_dict.get('use_bidirectional_attention', None)
+            attn_implementation = _config_dict.get('attn_implementation', "sdpa")
             model, processor, generate_func = self._bulid_language_model(
-                model_path=os.path.join(self.weight_path, self.weight_mapping_dict[model_name]['checkpoint_path']),
+                model_path=model_path,
                 load_visual_processor=load_visual_processor,
                 torch_dtype=torch_dtype,
                 classTokenizer=classTokenizer,
@@ -626,7 +664,7 @@ class modelBuilder:
                 set_pad_token_as_eos=True,
                 use_bidirectional_attention=use_bidirectional_attention,
                 attn_implementation=attn_implementation,
-                pp_device_map=_pp_device_map,
+                device_map=_pp_device_map,
             )
             hidden_size = model.config.text_config.hidden_size
             max_seq_len = model.config.text_config.max_position_embeddings
@@ -645,13 +683,12 @@ class modelBuilder:
                 }
             ]
 
-            use_bidirectional_attention = config_dict.get('use_bidirectional_attention', None) if config_dict is not None else None
-            # The field now expects 'all', 'vision', or None (not a bool)
+            use_bidirectional_attention = _config_dict.get('use_bidirectional_attention', None)
+            attn_implementation = _config_dict.get('attn_implementation', "sdpa")
             if isinstance(use_bidirectional_attention, bool):
                 use_bidirectional_attention = 'all' if use_bidirectional_attention else None
-
             model, processor, generate_func = self._bulid_language_model(
-                model_path=os.path.join(self.weight_path, self.weight_mapping_dict[model_name]['checkpoint_path']),
+                model_path=model_path,
                 load_visual_processor=load_visual_processor,
                 torch_dtype=torch_dtype,
                 classTokenizer=classTokenizer,
@@ -659,7 +696,8 @@ class modelBuilder:
                 classModel=classModel,
                 set_pad_token_as_eos=True,
                 use_bidirectional_attention=use_bidirectional_attention,
-                pp_device_map=_pp_device_map,
+                attn_implementation=attn_implementation,
+                device_map=_pp_device_map,
             )
             hidden_size = model.config.text_config.hidden_size
             max_seq_len = model.config.text_config.max_position_embeddings
@@ -753,8 +791,7 @@ class modelBuilder:
         set_pad_token_as_eos: bool = False,
         use_bidirectional_attention: bool = None,
         attn_implementation: str = "sdpa",
-        # attn_implementation: str = "flash_attention_2",
-        pp_device_map = None,
+        device_map = "auto",
         config_modifier = None,
         return_model_attr: str = None,
     ):
@@ -767,9 +804,7 @@ class modelBuilder:
             load_visual_processor = False
         
         if load_visual_processor:
-            processor = classProcessor.from_pretrained(
-                model_path,
-            )
+            processor = classProcessor.from_pretrained(model_path)
             try:
                 if processor.tokenizer.pad_token is None or set_pad_token_as_eos:
                     log_print("[Warning] have no pad_token, set pad_token = eos_token")
@@ -782,9 +817,7 @@ class modelBuilder:
                 log_print("[Warning] processor has no tokenizer attribute, skip setting pad_token")
                 
         else:
-            processor = classTokenizer.from_pretrained(
-                model_path,
-            )
+            processor = classTokenizer.from_pretrained(model_path)
             if processor.pad_token is None or set_pad_token_as_eos:
                 log_print("[Warning] have no pad_token, set pad_token = eos_token")
                 processor.pad_token = processor.eos_token
@@ -793,44 +826,28 @@ class modelBuilder:
                 log_print(f"pad_token: {processor.pad_token}, pad_token_id: {processor.pad_token_id}")
                 log_print(f"eos_token: {processor.eos_token}, eos_token_id: {processor.eos_token_id}")
 
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        if use_bidirectional_attention is not None:
+            config.text_config.use_bidirectional_attention = use_bidirectional_attention
+            log_print(f"Setting use_bidirectional_attention to {use_bidirectional_attention} for model at {model_path}")
+        if config_modifier is not None:
+            config = config_modifier(config) or config
+            log_print(f"Applied config_modifier to model at {model_path}")
+        # log_print(config)
 
-        # Resolve device_map: prefer explicit PP dict, fall back to 'auto'.
-        if pp_device_map is not None:
-            _device_map = pp_device_map 
-        else:
-            _device_map = "auto"
+        model = classModel.from_pretrained(
+            model_path,
+            config=config, 
+            dtype=torch_dtype,
+            device_map=device_map,
+            attn_implementation=attn_implementation, 
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        ).eval()
 
-        if use_bidirectional_attention is not None or config_modifier is not None:
-            from transformers import AutoConfig
-            config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-            if use_bidirectional_attention is not None:
-                log_print(f"Setting use_bidirectional_attention to {use_bidirectional_attention} for model at {model_path}")
-                config.text_config.use_bidirectional_attention = use_bidirectional_attention
-            if config_modifier is not None:
-                config = config_modifier(config) or config
-            # log_print(config)
-
-            model = classModel.from_pretrained(
-                model_path,
-                config=config, 
-                dtype=torch_dtype,
-                device_map=_device_map,
-                attn_implementation=attn_implementation, 
-                low_cpu_mem_usage=True,
-                trust_remote_code=True,
-            ).eval() # .cuda()
-        else:
-            model = classModel.from_pretrained(
-                model_path,
-                dtype=torch_dtype,
-                device_map=_device_map,
-                attn_implementation=attn_implementation, 
-                low_cpu_mem_usage=True,
-                trust_remote_code=True,
-            ).eval() # .cuda()
-
-        if pp_device_map is not None:
-            log_print(f"Model loaded with manual PP device_map: {_device_map}")
+        if device_map is not None:
+            log_print(f"Model loaded with manual PP device_map: {device_map}")
 
         if return_model_attr is not None:
             model = getattr(model, return_model_attr)
@@ -1070,4 +1087,3 @@ class modelBuilder:
         )
 
         return builder
-

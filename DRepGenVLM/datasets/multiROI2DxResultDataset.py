@@ -47,6 +47,7 @@ class Case:
     case_id: str
     rois: List[ROI]
     DxItem_targets: Dict[str, str]  # DxItem -> DxResultTxt (case-level ground truth)
+    DxItem_target_classes: Dict[str, str]  # DxItem -> authoritative DxResultCls
 
 
 class RandomDiscreteRotation:
@@ -242,18 +243,23 @@ class multiROI2DxResultDataset(Dataset):
                 roi_wh=record.roi_wh,
             ))
 
-        # Build case-level DxItem → DxResultTxt targets
+        # Keep the free-text target for SFT/text metrics and the class target
+        # separately for clinical metrics.  In particular, the evaluator must
+        # not re-infer a reference Nottingham grade from DxResultTxt.
         DxItem_targets = {}
+        DxItem_target_classes = {}
         for DxItem, DxSample in sample["structured_report"]["DxItems"].items():
             if DxItem not in self.DxItem_list:
                 continue
             DxItem_targets[DxItem] = DxSample["DxResultTxt"]
+            DxItem_target_classes[DxItem] = DxSample["DxResultCls"]
 
         case = Case(
             global_idx=sample["sample_idx"],
             case_id=str(sample["case_id"]),
             rois=roi_list,
             DxItem_targets=DxItem_targets,
+            DxItem_target_classes=DxItem_target_classes,
         )
         return case
 
@@ -290,7 +296,6 @@ class multiROI2DxResultDataset(Dataset):
         cfg.DxItem_list = dataset.DxItem_list
 
         return dataset
-
 
 
 

@@ -45,8 +45,12 @@ class DownstreamRepGenVLM(nn.Module):
         super().__init__()
         self.device = torch.device(device)
         self.use_text_gradient_checkpointing = False
+        # Reentrant text gradient checkpointing may require a grad-bearing
+        # inputs_embeds leaf.  The current non-checkpointed path does not.
+        self.require_cached_input_grad = False
         self.use_shared_vision_cache = True  # controlled by from_config via cfg.use_shared_vision_cache
         self.use_vision_lora = False
+        self.eval_prompt_batch_size = 6
 
     # ------------------------------------------------------------------
     # train() override – keep VLM backbone in eval when not checkpointing
@@ -55,11 +59,19 @@ class DownstreamRepGenVLM(nn.Module):
         super().train(mode)
         vlm_model = getattr(self, "vlm_model", None)
         if isinstance(vlm_model, nn.Module):
-            # LoRA wrappers keep trainable params; frozen base stays eval
+            # Keep the complete frozen VLM (including the transformer base)
+            # in eval mode.  PEFT LoRA dropout is the only stochastic module
+            # enabled during training; requires_grad on adapter parameters is
+            # independent from Module.training.
+            vlm_model.eval()
             if mode:
-                vlm_model.train()  # peft model.train() enables LoRA dropout etc.
-            else:
-                vlm_model.eval()
+                for module in vlm_model.modules():
+                    lora_dropout = getattr(module, "lora_dropout", None)
+                    if isinstance(lora_dropout, nn.ModuleDict):
+                        for dropout in lora_dropout.values():
+                            dropout.train(True)
+                    elif isinstance(lora_dropout, nn.Module):
+                        lora_dropout.train(True)
         return self
 
     # ------------------------------------------------------------------
@@ -678,22 +690,115 @@ class DownstreamRepGenVLM(nn.Module):
         return combined_embeds, attn_mask, combined_token_type_ids, labels
 
     # ------------------------------------------------------------------
-    # calculate_loss  (training)
+    # Pair-wise loss helpers
+    # ------------------------------------------------------------------
+    def prepare_case_loss_context(
+        self,
+        case: Case,
+    ) -> Optional[Dict[str, Any]]:
+        """Prepare immutable per-case inputs shared by every DxItem.
+
+        The shared vision prefix is detached and therefore carries no autograd
+        graph.  This lets the trainer backward each DxItem independently without
+        retain_graph=True while still running the frozen vision tower only once.
+        """
+        if not self.use_shared_vision_cache:
+            return None
+
+        (
+            vision_prefix_embeds,
+            q_start_in_ids,
+            vision_prefix_len_merged,
+            vision_prefix_attn_mask,
+            vision_prefix_token_type_ids,
+        ) = self._get_vision_prefix_embeds(case)
+        return {
+            "vision_prefix_embeds": vision_prefix_embeds,
+            "q_start_in_ids": q_start_in_ids,
+            "vision_prefix_len_merged": vision_prefix_len_merged,
+            "vision_prefix_attn_mask": vision_prefix_attn_mask,
+            "vision_prefix_token_type_ids": vision_prefix_token_type_ids,
+        }
+
+    def calculate_dxitem_loss(
+        self,
+        case: Case,
+        DxItem: str,
+        case_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Forward and compute loss for exactly one (case, DxItem) pair."""
+        if DxItem not in case.DxItem_targets:
+            raise KeyError(
+                f"Unknown DxItem={DxItem!r} for case_id={case.case_id}; "
+                f"available={list(case.DxItem_targets)}"
+            )
+
+        vlm = getattr(self, "vlm_model")
+        if self.use_shared_vision_cache:
+            if case_context is None:
+                raise ValueError(
+                    "case_context is required when use_shared_vision_cache=True. "
+                    "Call prepare_case_loss_context(case) once before iterating DxItems."
+                )
+            log_print(
+                f"case_id={case.case_id}, rois={len(case.rois)}, "
+                f"DxItems={list(case.DxItem_targets.keys())}"
+                f"context_len={case_context['vision_prefix_attn_mask'].shape}, "
+            )
+            combined_embeds, attn_mask, token_type_ids, labels = (
+                self.build_train_inputs_with_vision_cache(
+                    case=case,
+                    DxItem=DxItem,
+                    vision_prefix_embeds=case_context["vision_prefix_embeds"],
+                    q_start_in_ids=case_context["q_start_in_ids"],
+                    vision_prefix_len_merged=case_context["vision_prefix_len_merged"],
+                    vision_prefix_attn_mask=case_context["vision_prefix_attn_mask"],
+                    vision_prefix_token_type_ids=case_context[
+                        "vision_prefix_token_type_ids"
+                    ],
+                )
+            )
+            # Text LoRA parameters create their own autograd path even though the
+            # cached inputs are detached.  A dummy input leaf is needed only for
+            # model topologies such as reentrant gradient checkpointing that
+            # explicitly require a grad-bearing input.
+            if self.require_cached_input_grad:
+                combined_embeds = combined_embeds.requires_grad_(True)
+            forward_kwargs = {
+                "inputs_embeds": combined_embeds,
+                "attention_mask": attn_mask,
+                "use_cache": False,
+            }
+            if token_type_ids is not None:
+                forward_kwargs["token_type_ids"] = token_type_ids
+            outputs = vlm(**forward_kwargs)
+        else:
+            inputs, labels = self.build_train_inputs(case=case, DxItem=DxItem)
+            outputs = vlm(
+                **inputs,
+                output_hidden_states=False,
+                use_cache=False,
+            )
+
+        context = f"case_id={case.case_id}, DxItem={DxItem}"
+        return self.criterion(
+            logits=outputs.logits,
+            labels=labels,
+            context=context,
+        )
+
+    # ------------------------------------------------------------------
+    # calculate_loss  (aggregate/no-backward callers such as validation)
     # ------------------------------------------------------------------
     def calculate_loss(self,
         batch_cases: List[Case],
+        case_contexts: Optional[Dict[int, Optional[Dict[str, Any]]]] = None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[int, Dict[str, Any]]]:
-        """Forward + loss for a batch; iterates cases × DxItems.
+        """Return the mean loss for callers that do not stream backward.
 
-        When use_shared_vision_cache=True (default):
-          - One no_grad VLM forward per case captures the merged vision prefix.
-          - Each DxItem then only runs the text decoder (with LoRA) forward.
-          - Vision tower is run once regardless of DxItem count – no redundant
-            image encoding, and no vision-tower activations stored for backward.
-
-        When use_shared_vision_cache=False:
-          - Original full forward per (case, DxItem).
-          - Use this when the vision tower itself has LoRA adapters.
+        Training uses prepare_case_loss_context() + calculate_dxitem_loss()
+        directly so each pair's graph can be released immediately.  Validation
+        runs under torch.no_grad(), where aggregating scalar losses is harmless.
         """
         batch_cases = self._normalize_batch(batch_cases)
         all_losses: List[torch.Tensor] = []
@@ -705,69 +810,23 @@ class DownstreamRepGenVLM(nn.Module):
                 f"DxItems={list(case.DxItem_targets.keys())}"
             )
             output_case_dict[case.global_idx] = {}
+            case_context = (
+                case_contexts.get(case.global_idx)
+                if case_contexts is not None
+                else self.prepare_case_loss_context(case)
+            )
 
-            # ---- Shared vision cache path ----
-            if self.use_shared_vision_cache:
-                (
-                    vision_prefix_embeds,
-                    q_start_in_ids,
-                    vision_prefix_len_merged,
-                    vision_prefix_attn_mask,
-                    vision_prefix_token_type_ids,
-                ) = self._get_vision_prefix_embeds(case)
-                for DxItem in case.DxItem_targets:
-                    combined_embeds, attn_mask, token_type_ids, labels = (
-                        self.build_train_inputs_with_vision_cache(
-                            case=case,
-                            DxItem=DxItem,
-                            vision_prefix_embeds=vision_prefix_embeds,
-                            q_start_in_ids=q_start_in_ids,
-                            vision_prefix_len_merged=vision_prefix_len_merged,
-                            vision_prefix_attn_mask=vision_prefix_attn_mask,
-                            vision_prefix_token_type_ids=vision_prefix_token_type_ids,
-                        )
-                    )
-                    # combined_embeds has no grad_fn (vision prefix and suffix were
-                    # both produced under no_grad).  Marking it as a requires_grad
-                    # leaf ensures PyTorch builds a full autograd graph through the
-                    # LoRA params during forward, so backward() can reach them.
-                    # The dummy gradient accumulated in combined_embeds.grad is
-                    # discarded when the local variable goes out of scope.
-                    combined_embeds = combined_embeds.requires_grad_(True)
-                    vlm = getattr(self, "vlm_model")
-                    forward_kwargs = {
-                        "inputs_embeds": combined_embeds,
-                        "attention_mask": attn_mask,
-                        "use_cache": False,
-                    }
-                    if token_type_ids is not None:
-                        forward_kwargs["token_type_ids"] = token_type_ids
-                    outputs = vlm(
-                        **forward_kwargs,
-                    )
-                    logits = outputs.logits
-                    context = f"case_id={case.case_id}, DxItem={DxItem}"
-                    loss_dict = self.criterion(logits=logits, labels=labels, context=context)
-                    all_losses.append(loss_dict["total_loss"])
-                    output_case_dict[case.global_idx][DxItem] = {
-                        "pred_txt": None,
-                        "gt_txt": case.DxItem_targets[DxItem],
-                    }
-
-            # ---- Original full forward path (vision tower has LoRA) ----
-            else:
-                for DxItem in case.DxItem_targets:
-                    inputs, labels = self.build_train_inputs(case=case, DxItem=DxItem)
-                    vlm = getattr(self, "vlm_model")
-                    outputs = vlm(**inputs, output_hidden_states=False, use_cache=False)
-                    logits = outputs.logits
-                    context = f"case_id={case.case_id}, DxItem={DxItem}"
-                    loss_dict = self.criterion(logits=logits, labels=labels, context=context)
-                    all_losses.append(loss_dict["total_loss"])
-                    output_case_dict[case.global_idx][DxItem] = {
-                        "pred_txt": None,
-                        "gt_txt": case.DxItem_targets[DxItem],
-                    }
+            for DxItem in case.DxItem_targets:
+                loss_dict = self.calculate_dxitem_loss(
+                    case=case,
+                    DxItem=DxItem,
+                    case_context=case_context,
+                )
+                all_losses.append(loss_dict["total_loss"])
+                output_case_dict[case.global_idx][DxItem] = {
+                    "pred_txt": None,
+                    "gt_txt": case.DxItem_targets[DxItem],
+                }
 
         if len(all_losses) == 0:
             raise RuntimeError("Empty batch; unable to compute loss.")
@@ -778,48 +837,329 @@ class DownstreamRepGenVLM(nn.Module):
     # ------------------------------------------------------------------
     # generate_outputs  (inference / validation)
     # ------------------------------------------------------------------
+    def _build_inference_suffix_tokens(
+        self,
+        case: Case,
+        DxItem: str,
+        expected_q_start: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Tokenize only to recover the post-vision question suffix.
+
+        The processor is called one prompt at a time, so pixel_values are never
+        replicated six-fold.  Pixel tensors are discarded without entering the
+        VLM; the already cached merged vision prefix is used for generation.
+        """
+        messages = self._build_inference_messages(case=case, DxItem=DxItem)
+        prompt = self._apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+        )
+        images = [roi.image for roi in case.rois if roi.image is not None]
+        raw_inputs = self.vlm_processor(
+            text=prompt,
+            images=images if images else None,
+            return_tensors="pt",
+        )
+        input_ids = raw_inputs["input_ids"]
+        sep_positions = (
+            input_ids[0] == self.sep_tok_id
+        ).nonzero(as_tuple=True)[0]
+        if sep_positions.numel() == 0:
+            raise RuntimeError(
+                f"No sep token found for case_id={case.case_id}, "
+                f"DxItem={DxItem}."
+            )
+        q_start = int(sep_positions[-1].item()) + 1
+        if q_start != int(expected_q_start):
+            raise RuntimeError(
+                "The shared multimodal prefix changed between DxItems: "
+                f"expected q_start={expected_q_start}, got {q_start} for "
+                f"case_id={case.case_id}, DxItem={DxItem}."
+            )
+
+        suffix_ids = input_ids[:, q_start:].clone()
+        raw_attention_mask = raw_inputs.get("attention_mask")
+        if raw_attention_mask is None:
+            suffix_attention_mask = torch.ones_like(suffix_ids)
+        else:
+            suffix_attention_mask = raw_attention_mask[
+                :,
+                q_start:,
+            ].clone()
+        raw_token_type_ids = raw_inputs.get("token_type_ids")
+        suffix_token_type_ids = (
+            raw_token_type_ids[:, q_start:].clone()
+            if raw_token_type_ids is not None
+            else None
+        )
+        return (
+            suffix_ids,
+            suffix_attention_mask,
+            suffix_token_type_ids,
+        )
+
+    def _generate_case_with_vision_cache(
+        self,
+        case: Case,
+        case_context: Dict[str, Any],
+        max_new_tokens: int,
+        prompt_batch_size: int,
+    ) -> Dict[str, Dict[str, str]]:
+        dx_items = list(case.DxItem_targets)
+        results: Dict[str, Dict[str, str]] = {}
+        vlm = getattr(self, "vlm_model")
+        embed_tokens = self._get_embed_tokens()
+
+        prefix_embeds = case_context["vision_prefix_embeds"]
+        prefix_attention = case_context["vision_prefix_attn_mask"]
+        prefix_token_types = case_context["vision_prefix_token_type_ids"]
+        q_start = int(case_context["q_start_in_ids"])
+        prefix_length = int(prefix_embeds.shape[1])
+        hidden_size = int(prefix_embeds.shape[2])
+
+        for chunk_start in range(0, len(dx_items), prompt_batch_size):
+            chunk_items = dx_items[
+                chunk_start:chunk_start + prompt_batch_size
+            ]
+            suffix_records = [
+                self._build_inference_suffix_tokens(
+                    case=case,
+                    DxItem=dx_item,
+                    expected_q_start=q_start,
+                )
+                for dx_item in chunk_items
+            ]
+            suffix_lengths = [
+                int(record[0].shape[1])
+                for record in suffix_records
+            ]
+            max_sequence_length = prefix_length + max(suffix_lengths)
+            batch_size = len(chunk_items)
+            combined_embeds = torch.zeros(
+                (
+                    batch_size,
+                    max_sequence_length,
+                    hidden_size,
+                ),
+                dtype=prefix_embeds.dtype,
+                device=prefix_embeds.device,
+            )
+            attention_mask = torch.zeros(
+                (batch_size, max_sequence_length),
+                dtype=prefix_attention.dtype,
+                device=prefix_embeds.device,
+            )
+            token_type_ids = (
+                torch.zeros(
+                    (batch_size, max_sequence_length),
+                    dtype=prefix_token_types.dtype,
+                    device=prefix_embeds.device,
+                )
+                if prefix_token_types is not None
+                else None
+            )
+
+            for row_idx, (
+                suffix_ids,
+                suffix_attention,
+                suffix_token_types,
+            ) in enumerate(suffix_records):
+                suffix_length = suffix_lengths[row_idx]
+                # Decoder-only batched generation requires left padding.  Place
+                # padding before the shared prefix so prefix and question remain
+                # contiguous and every row ends at the same final prompt index.
+                left_padding = (
+                    max_sequence_length - prefix_length - suffix_length
+                )
+                prefix_end = left_padding + prefix_length
+                combined_embeds[
+                    row_idx,
+                    left_padding:prefix_end,
+                ] = prefix_embeds[0]
+                attention_mask[
+                    row_idx,
+                    left_padding:prefix_end,
+                ] = prefix_attention[0]
+
+                with torch.no_grad():
+                    suffix_embeds = embed_tokens(
+                        suffix_ids.to(embed_tokens.weight.device)
+                    ).to(
+                        device=prefix_embeds.device,
+                        dtype=prefix_embeds.dtype,
+                    )
+                combined_embeds[
+                    row_idx,
+                    prefix_end:,
+                ] = suffix_embeds[0]
+                attention_mask[
+                    row_idx,
+                    prefix_end:,
+                ] = suffix_attention[0].to(
+                    prefix_embeds.device
+                )
+
+                if token_type_ids is not None:
+                    if suffix_token_types is None:
+                        raise RuntimeError(
+                            "token_type_ids disappeared between the cached "
+                            "prefix and inference suffix."
+                        )
+                    token_type_ids[
+                        row_idx,
+                        left_padding:prefix_end,
+                    ] = prefix_token_types[0]
+                    token_type_ids[
+                        row_idx,
+                        prefix_end:,
+                    ] = suffix_token_types[0].to(
+                        prefix_embeds.device
+                    )
+                elif suffix_token_types is not None:
+                    raise RuntimeError(
+                        "token_type_ids appeared only in the inference suffix."
+                    )
+
+            generation_kwargs = {
+                "inputs_embeds": combined_embeds,
+                "attention_mask": attention_mask,
+                "max_new_tokens": max_new_tokens,
+                "do_sample": False,
+                "top_p": None,
+                "top_k": None,
+                "pad_token_id": (
+                    self.vlm_processor.tokenizer.pad_token_id
+                ),
+                "use_cache": True,
+            }
+            if token_type_ids is not None:
+                generation_kwargs["token_type_ids"] = token_type_ids
+            generated = vlm.generate(**generation_kwargs)
+
+            # transformers initializes an empty input_ids sequence when
+            # inputs_embeds is supplied to a decoder-only model, so `generated`
+            # contains only newly generated token IDs.
+            for row_idx, dx_item in enumerate(chunk_items):
+                pred_txt = self.vlm_processor.tokenizer.decode(
+                    generated[row_idx],
+                    skip_special_tokens=True,
+                ).strip()
+                results[dx_item] = {
+                    "pred_txt": pred_txt,
+                    "gt_txt": case.DxItem_targets[dx_item],
+                }
+
+        return results
+
+    def _generate_case_uncached(
+        self,
+        case: Case,
+        max_new_tokens: int,
+    ) -> Dict[str, Dict[str, str]]:
+        results: Dict[str, Dict[str, str]] = {}
+        vlm = getattr(self, "vlm_model")
+        for DxItem in case.DxItem_targets:
+            messages = self._build_inference_messages(
+                case=case,
+                DxItem=DxItem,
+            )
+            prompt = self._apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+            )
+            images = [
+                roi.image for roi in case.rois if roi.image is not None
+            ]
+            inputs = self._encode_inputs(
+                text_prompt=prompt,
+                images=images,
+            )
+            generated = vlm.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                top_p=None,
+                top_k=None,
+                pad_token_id=(
+                    self.vlm_processor.tokenizer.pad_token_id
+                ),
+                use_cache=True,
+            )
+            prompt_len = inputs["input_ids"].shape[1]
+            pred_txt = self.vlm_processor.tokenizer.decode(
+                generated[0, prompt_len:],
+                skip_special_tokens=True,
+            ).strip()
+            results[DxItem] = {
+                "pred_txt": pred_txt,
+                "gt_txt": case.DxItem_targets[DxItem],
+            }
+        return results
+
     @torch.no_grad()
     def generate_outputs(self,
         batch_cases: List[Case],
         max_new_tokens: int = 256,
+        case_contexts: Optional[Dict[int, Optional[Dict[str, Any]]]] = None,
     ) -> Dict[int, Dict[str, Any]]:
-        """Run model.generate() for each (case, DxItem); return pred texts.
+        """Generate all DxItems, batching prompts that share a vision prefix.
 
         Returns:
             output_case_dict: {case.global_idx: {DxItem: {"pred_txt": str, "gt_txt": str}}}
         """
         batch_cases = self._normalize_batch(batch_cases)
         output_case_dict: Dict[int, Dict[str, Any]] = {}
-        vlm = getattr(self, "vlm_model")
-
         for case in batch_cases:
-            output_case_dict[case.global_idx] = {}
-            for DxItem in case.DxItem_targets:
-                messages = self._build_inference_messages(case=case, DxItem=DxItem)
-                prompt = self._apply_chat_template(messages, add_generation_prompt=True)
-                images = [roi.image for roi in case.rois if roi.image is not None]
-                inputs = self._encode_inputs(text_prompt=prompt, images=images)
-
-                generated = vlm.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    top_p=None,
-                    top_k=None,
-                    pad_token_id=self.vlm_processor.tokenizer.pad_token_id,
-                    use_cache=True,
-                )
-                # Decode only the newly generated tokens
-                prompt_len = inputs["input_ids"].shape[1]
-                new_token_ids = generated[0, prompt_len:]
-                pred_txt = self.vlm_processor.tokenizer.decode(
-                    new_token_ids, skip_special_tokens=True
-                ).strip()
-
-                output_case_dict[case.global_idx][DxItem] = {
-                    "pred_txt": pred_txt,
-                    "gt_txt": case.DxItem_targets[DxItem],
-                }
+            case_context = (
+                case_contexts.get(case.global_idx)
+                if case_contexts is not None
+                else self.prepare_case_loss_context(case)
+            )
+            if self.use_shared_vision_cache and case_context is not None:
+                try:
+                    output_case_dict[case.global_idx] = (
+                        self._generate_case_with_vision_cache(
+                            case=case,
+                            case_context=case_context,
+                            max_new_tokens=max_new_tokens,
+                            prompt_batch_size=max(
+                                1,
+                                int(self.eval_prompt_batch_size),
+                            ),
+                        )
+                    )
+                    continue
+                except (RuntimeError, ValueError, TypeError) as exc:
+                    log_print(
+                        "[VisionCache][WARN] Batched cached generation "
+                        f"failed for case_id={case.case_id}: {exc}. "
+                        "Retrying cached generation with one prompt at a time."
+                    )
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    try:
+                        output_case_dict[case.global_idx] = (
+                            self._generate_case_with_vision_cache(
+                                case=case,
+                                case_context=case_context,
+                                max_new_tokens=max_new_tokens,
+                                prompt_batch_size=1,
+                            )
+                        )
+                        continue
+                    except (RuntimeError, ValueError, TypeError) as retry_exc:
+                        log_print(
+                            "[VisionCache][WARN] Sequential cached "
+                            f"generation also failed for case_id="
+                            f"{case.case_id}: {retry_exc}. Falling back to "
+                            "sequential full-VLM generation."
+                        )
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+            output_case_dict[case.global_idx] = self._generate_case_uncached(
+                case=case,
+                max_new_tokens=max_new_tokens,
+            )
 
         return output_case_dict
 
@@ -909,15 +1249,10 @@ class DownstreamRepGenVLM(nn.Module):
             torch_dtype=torch.bfloat16,
             config_dict={
                 "use_bidirectional_attention": False,  # SFT requires causal (left-to-right) attention
-                "attn_implementation": (
-                    getattr(cfg, "attn_implementation", "sdpa") or "sdpa"
-                ),
+                "attn_implementation": getattr(cfg, "attn_implementation", None),
+                "pp_vision_split_index": getattr(cfg, "pp_vision_split_index", None),
             },
-            pp_num_gpus=(
-                getattr(cfg, "pp_num_gpus", None)
-                if getattr(cfg, "training_mode", None) == "PP"
-                else None
-            ),
+            pp_num_gpus=getattr(cfg, "pp_num_gpus", None) if getattr(cfg, "training_mode", None) == "PP" else None,
         )
 
         model = cls(device=cfg.device)
@@ -939,7 +1274,14 @@ class DownstreamRepGenVLM(nn.Module):
         )
 
         model.use_shared_vision_cache = use_shared_vision_cache
+        model.eval_prompt_batch_size = max(
+            1,
+            int(getattr(cfg, "eval_prompt_batch_size", 6)),
+        )
         log_print(f"use_shared_vision_cache = {model.use_shared_vision_cache}")
+        log_print(
+            f"eval_prompt_batch_size = {model.eval_prompt_batch_size}"
+        )
         log_print(f"use_vision_lora = {model.use_vision_lora}")
 
         if load_criterion:
@@ -951,11 +1293,6 @@ class DownstreamRepGenVLM(nn.Module):
 
         log_print("...Done\n")
         return model
-
-
-
-
-
 
 
 

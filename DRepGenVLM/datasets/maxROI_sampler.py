@@ -14,27 +14,48 @@ from torch.utils.data import Sampler
 
 
 class MaxROIBatchSampler(Sampler[List[int]]):
+    """Build DataLoader batches under a per-batch ROI budget.
+
+    The budget applies to one yielded microbatch only. Gradient accumulation
+    and optimizer-update grouping are intentionally outside this sampler.
+    """
+
     def __init__(
         self,
         sampler: Iterable[int],
         roi_count_func: Callable[[int], int],
         batch_size: int,
-        max_rois_per_update: Optional[int],
+        max_rois_per_batch: Optional[int] = None,
         drop_last: bool = False,
+        max_rois_per_update: Optional[int] = None,
     ):
+        if (
+            max_rois_per_batch is not None
+            and max_rois_per_update is not None
+            and int(max_rois_per_batch) != int(max_rois_per_update)
+        ):
+            raise ValueError(
+                "Conflicting ROI budgets: max_rois_per_batch="
+                f"{max_rois_per_batch} and legacy max_rois_per_update="
+                f"{max_rois_per_update}."
+            )
+        if max_rois_per_batch is None:
+            max_rois_per_batch = max_rois_per_update
+
         self.sampler = sampler
         self.roi_count_func = roi_count_func
         self.batch_size = int(batch_size)
-        self.max_rois_per_update = (
-            int(max_rois_per_update) if max_rois_per_update is not None else None
+        self.max_rois_per_batch = (
+            int(max_rois_per_batch) if max_rois_per_batch is not None else None
         )
         self.drop_last = drop_last
 
         if self.batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {self.batch_size}.")
-        if self.max_rois_per_update is not None and self.max_rois_per_update <= 0:
+        if self.max_rois_per_batch is not None and self.max_rois_per_batch <= 0:
             raise ValueError(
-                f"max_rois_per_update must be positive or None, got {self.max_rois_per_update}."
+                "max_rois_per_batch must be positive or None, got "
+                f"{self.max_rois_per_batch}."
             )
         self._cached_batches: Optional[List[List[int]]] = None
 
@@ -57,8 +78,8 @@ class MaxROIBatchSampler(Sampler[List[int]]):
                 for pos, idx in enumerate(remaining):
                     roi_count = int(self.roi_count_func(idx))
                     fits_roi_budget = (
-                        self.max_rois_per_update is None
-                        or roi_total + roi_count <= self.max_rois_per_update
+                        self.max_rois_per_batch is None
+                        or roi_total + roi_count <= self.max_rois_per_batch
                     )
                     if fits_roi_budget or len(batch) == 0:
                         found_pos = pos

@@ -12,6 +12,7 @@
 import os
 from typing import Optional, List
 
+import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, RandomSampler, SequentialSampler
 
@@ -32,8 +33,28 @@ class datasetHandler:
         drop_last: bool = False,
         prefetch_factor: Optional[int] = None,
         use_max_roi_sampler: bool = False,
+        max_rois_per_batch: Optional[int] = None,
         max_rois_per_update: Optional[int] = None,
+        dataloader_seed: int = 42,
     ):
+        if (
+            max_rois_per_batch is not None
+            and max_rois_per_update is not None
+            and int(max_rois_per_batch) != int(max_rois_per_update)
+        ):
+            raise ValueError(
+                "Conflicting ROI budgets: max_rois_per_batch="
+                f"{max_rois_per_batch} and legacy max_rois_per_update="
+                f"{max_rois_per_update}."
+            )
+        if max_rois_per_batch is None:
+            max_rois_per_batch = max_rois_per_update
+            if max_rois_per_update is not None:
+                log_print(
+                    "Deprecated config key max_rois_per_update detected; "
+                    "treating it as max_rois_per_batch."
+                )
+
         log_print("Loading DataLoaders...")
 
         self.DDP_status_detect()
@@ -48,7 +69,12 @@ class datasetHandler:
         self.drop_last = drop_last
         self.prefetch_factor = prefetch_factor
         self.use_max_roi_sampler = bool(use_max_roi_sampler)
-        self.max_rois_per_update = max_rois_per_update
+        self.max_rois_per_batch = max_rois_per_batch
+        self.dataloader_seed = int(dataloader_seed)
+        self.train_generator = torch.Generator()
+        self.train_generator.manual_seed(self.dataloader_seed)
+        self.valid_generator = torch.Generator()
+        self.valid_generator.manual_seed(self.dataloader_seed + 1)
 
         self.create_train_loader()
         self.create_valid_loader()
@@ -69,13 +95,17 @@ class datasetHandler:
         shuffle_flag: bool, 
         drop_last: bool, 
         batch_sampler = None,
+        generator: Optional[torch.Generator] = None,
     ):
         loader_kwargs = {
             "dataset": dataset,
             "num_workers": self.num_workers,
             "pin_memory": self.pin_memory,
-            "persistent_workers": (self.num_workers > 0),
+            # Recreating workers each epoch lets a restored DataLoader generator
+            # reproduce both sampler order and worker Python/NumPy/torch seeds.
+            "persistent_workers": False,
             "collate_fn": dataset.collate_cases,
+            "generator": generator,
         }
         if self.prefetch_factor is not None and self.num_workers > 0:
             loader_kwargs["prefetch_factor"] = self.prefetch_factor
@@ -106,7 +136,7 @@ class datasetHandler:
                 drop_last=self.drop_last,
             )
         if self.train_shuffle:
-            return RandomSampler(dataset)
+            return RandomSampler(dataset, generator=self.train_generator)
         return SequentialSampler(dataset)
 
     def create_train_loader(self):
@@ -127,7 +157,7 @@ class datasetHandler:
                 sampler=base_sampler,
                 roi_count_func=self.train_dataset.get_effective_roi_count,
                 batch_size=self.batch_size,
-                max_rois_per_update=self.max_rois_per_update,
+                max_rois_per_batch=self.max_rois_per_batch,
                 drop_last=self.drop_last,
             )
             self.train_loader = self._build_loader(
@@ -136,6 +166,7 @@ class datasetHandler:
                 shuffle_flag=False,
                 drop_last=False,
                 batch_sampler=train_batch_sampler,
+                generator=self.train_generator,
             )
 
             if self._is_main():
@@ -143,8 +174,8 @@ class datasetHandler:
                 log_print(
                     "MaxROIBatchSampler enabled: "
                     f"batch_size={self.batch_size}, "
-                    f"max_rois_per_update={self.max_rois_per_update}, "
-                    f"num_update_groups={len(self.train_loader)}"
+                    f"max_rois_per_batch={self.max_rois_per_batch}, "
+                    f"num_batches={len(self.train_loader)}"
                 )
             return
 
@@ -157,6 +188,7 @@ class datasetHandler:
             sampler=train_sampler,
             shuffle_flag=self.train_shuffle,
             drop_last=self.drop_last,
+            generator=self.train_generator,
         )
 
         if self._is_main():
@@ -183,6 +215,7 @@ class datasetHandler:
             sampler=valid_sampler,
             shuffle_flag=False,
             drop_last=False,
+            generator=self.valid_generator,
         )
 
         if self._is_main():
@@ -218,7 +251,12 @@ class datasetHandler:
             drop_last=cfg.drop_last,
             prefetch_factor=cfg.prefetch_factor,
             use_max_roi_sampler=getattr(cfg, "use_max_roi_sampler", False),
-            max_rois_per_update=getattr(cfg, "max_rois_per_update", None),
+            max_rois_per_batch=getattr(
+                cfg,
+                "max_rois_per_batch",
+                getattr(cfg, "max_rois_per_update", None),
+            ),
+            dataloader_seed=getattr(cfg, "dataloader_seed", 42),
         )
         cfg.num_batchs_per_epoch = len(handler.train_loader) if handler.train_loader is not None else 0
 

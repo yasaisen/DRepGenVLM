@@ -19,8 +19,8 @@ from typing import Dict, Optional, List
 PROJECT_MAPPING_DICT = {
     "MG15_basic_overfitTesting": {
         "model_name": "medgemma-1.5-4b-it",
-        "train_ann_file": "[metadata]downstreamRepGenVLM[NAS3test]_v2.1_2607151447.json",
-        "valid_ann_file": "[metadata]downstreamRepGenVLM[NAS3test]_v2.1_2607151447.json",
+        "train_ann_file": "[metadata]downstreamRepGenVLM[NAS6test]_v3.2_2607231450.json",
+        "valid_ann_file": "[metadata]downstreamRepGenVLM[NAS6test]_v3.2_2607231450.json",
         "input_img": True,
         "input_loc": True,
         "level_key": "main_info",
@@ -29,14 +29,17 @@ PROJECT_MAPPING_DICT = {
         "max_rois_per_case": 30,
         "roi_sampling_mode": "random_k",
         "valid_sampling_seed": 42,
+        "dataloader_seed": 42,
         "use_max_roi_sampler": True,
-        "max_rois_per_update": 60,
+        "max_rois_per_batch": 60,
         "lora_r": 16,
         "lora_alpha": 32,
         "lora_dropout": 0.05,
         "lora_target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"],
         "use_vision_lora": False,
         "max_new_tokens": 256,
+        "eval_prompt_batch_size": 6,
+        "strict_evaluator_predictions": True,
         "general_learning_rate": 1e-4,
         "gradient_clip_norm": 1.0,
         "num_epochs": 50,
@@ -44,6 +47,7 @@ PROJECT_MAPPING_DICT = {
         "early_stop_patience": 20,
         "training_mode": "PP",
         "pp_num_gpus": 4,
+        "pp_vision_split_index": 14,
         "attn_implementation": "sdpa",
         "use_shared_vision_cache": True,
     },
@@ -54,8 +58,42 @@ PROJECT_MAPPING_DICT = {
     # ======================================================== #
     "MG15_basic_PP4G": {
         "model_name": "medgemma-1.5-4b-it",
-        "train_ann_file": "[metadata]downstreamRepGenVLM[NAS3train]_v2.1_2607151447.json",
-        "valid_ann_file": "[metadata]downstreamRepGenVLM[NAS3test]_v2.1_2607151447.json",
+        "train_ann_file": "[metadata]downstreamRepGenVLM[NAS6train]_v3.2_2607231450.json",
+        "valid_ann_file": "[metadata]downstreamRepGenVLM[NAS6test]_v3.2_2607231450.json",
+        "input_img": True,
+        "input_loc": True,
+        "level_key": "main_info",
+        "batch_size": 1,
+        "accumulation_steps": 8,
+        "max_rois_per_case": 145,
+        "roi_sampling_mode": "random_k",
+        "valid_sampling_seed": 42,
+        "dataloader_seed": 42,
+        "use_max_roi_sampler": True,
+        "max_rois_per_batch": 145,
+        "lora_r": 16,
+        "lora_alpha": 32,
+        "lora_dropout": 0.05,
+        "lora_target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"],
+        "use_vision_lora": False,
+        "max_new_tokens": 256,
+        "eval_prompt_batch_size": 6,
+        "strict_evaluator_predictions": True,
+        "general_learning_rate": 1e-4,
+        "gradient_clip_norm": 1.0,
+        "num_epochs": 50,
+        "warmup_steps": None,
+        "early_stop_patience": 20,
+        "training_mode": "PP",
+        "pp_num_gpus": 8,
+        "pp_vision_split_index": 0,
+        "attn_implementation": "sdpa",
+        "use_shared_vision_cache": True,
+    },
+    "MG15_basic_R30_PP4G": {
+        "model_name": "medgemma-1.5-4b-it",
+        "train_ann_file": "[metadata]downstreamRepGenVLM[NAS6train]_v3.2_2607231450.json",
+        "valid_ann_file": "[metadata]downstreamRepGenVLM[NAS6test]_v3.2_2607231450.json",
         "input_img": True,
         "input_loc": True,
         "level_key": "main_info",
@@ -64,14 +102,17 @@ PROJECT_MAPPING_DICT = {
         "max_rois_per_case": 30,
         "roi_sampling_mode": "random_k",
         "valid_sampling_seed": 42,
+        "dataloader_seed": 42,
         "use_max_roi_sampler": True,
-        "max_rois_per_update": 60,
+        "max_rois_per_batch": 30,
         "lora_r": 16,
         "lora_alpha": 32,
         "lora_dropout": 0.05,
         "lora_target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"],
         "use_vision_lora": False,
         "max_new_tokens": 256,
+        "eval_prompt_batch_size": 6,
+        "strict_evaluator_predictions": True,
         "general_learning_rate": 1e-4,
         "gradient_clip_norm": 1.0,
         "num_epochs": 50,
@@ -79,6 +120,7 @@ PROJECT_MAPPING_DICT = {
         "early_stop_patience": 20,
         "training_mode": "PP",
         "pp_num_gpus": 4,
+        "pp_vision_split_index": 14,
         "attn_implementation": "sdpa",
         "use_shared_vision_cache": True,
     },
@@ -95,14 +137,17 @@ PROJECT_MAPPING_DICT = {
         "max_rois_per_case": None,
         "roi_sampling_mode": None,
         "valid_sampling_seed": 42,
+        "dataloader_seed": 42,
         "use_max_roi_sampler": False,
-        "max_rois_per_update": None,
+        "max_rois_per_batch": None,
         "lora_r": 16,
         "lora_alpha": 32,
         "lora_dropout": 0.05,
         "lora_target_modules": ["q_proj", "v_proj"],
         "use_vision_lora": False,
         "max_new_tokens": 256,
+        "eval_prompt_batch_size": 6,
+        "strict_evaluator_predictions": True,
         "general_learning_rate": None,
         "gradient_clip_norm": None,
         "num_epochs": None,
@@ -110,6 +155,7 @@ PROJECT_MAPPING_DICT = {
         "early_stop_patience": None,
         "training_mode": None,
         "pp_num_gpus": None,
+        "pp_vision_split_index": 14,
         "attn_implementation": "sdpa",
         "use_shared_vision_cache": False,
     },
@@ -138,13 +184,13 @@ class DRGVLM_baseConfig:
         self.setup_configHandler(project_dict=project_dict)
 
     def setup_path(self):
-        self.localGPU_image_path = "/media/yasaisen/NAS8/for_research/datasets"
+        self.localGPU_image_path = "/media/yasaisen/NAS8/for_research/datasets/WSI_fromNAS"
         self.localGPU_metadata_path = "/media/yasaisen/NAS8/for_research/metadatas"
         self.localGPU_weight_path = "/media/yasaisen/NAS8/for_research/weights"
         self.localGPU_root_path = "/media/yasaisen/NAS8/for_research/R27_MVLM_v3.19"
 
         if self.is_HPC:
-            self.image_path = "/work/misaka13/datasets"
+            self.image_path = "/work/misaka13/datasets/WSI_fromNAS"
             self.metadata_path = "/work/misaka13/metadatas"
             self.weight_path = "/work/misaka13/weights"
             self.root_path = "/work/misaka13/R27_MVLM_v3.19"
@@ -180,9 +226,25 @@ class DRGVLM_baseConfig:
             self.max_rois_per_case = 2
             self.roi_sampling_mode = "random_k"
         self.valid_sampling_seed = int(project_dict.get("valid_sampling_seed", 42))
+        self.dataloader_seed = int(project_dict.get("dataloader_seed", 42))
 
         self.use_max_roi_sampler = bool(project_dict.get("use_max_roi_sampler", False))
-        self.max_rois_per_update = project_dict.get("max_rois_per_update", None)
+        new_roi_budget = project_dict.get("max_rois_per_batch", None)
+        legacy_roi_budget = project_dict.get("max_rois_per_update", None)
+        if (
+            new_roi_budget is not None
+            and legacy_roi_budget is not None
+            and int(new_roi_budget) != int(legacy_roi_budget)
+        ):
+            raise ValueError(
+                "Conflicting config values for max_rois_per_batch and legacy "
+                "max_rois_per_update."
+            )
+        self.max_rois_per_batch = (
+            new_roi_budget
+            if "max_rois_per_batch" in project_dict
+            else legacy_roi_budget
+        )
 
     def setup_modelBuilder(self,
         project_dict: Dict = None,
@@ -204,6 +266,9 @@ class DRGVLM_baseConfig:
 
         # Generation
         self.max_new_tokens = int(project_dict.get("max_new_tokens", 256))
+        self.eval_prompt_batch_size = int(
+            project_dict.get("eval_prompt_batch_size", 6)
+        )
 
         # Shared vision cache skips re-running the frozen vision tower per DxItem.
         # Vision LoRA is configured independently and cannot be combined with it.
@@ -218,6 +283,9 @@ class DRGVLM_baseConfig:
         # Pipeline Parallelism settings
         self.training_mode = project_dict.get("training_mode", "PP")
         self.attn_implementation = project_dict.get("attn_implementation", "sdpa")
+        self.pp_vision_split_index = int(
+            project_dict.get("pp_vision_split_index", 14)
+        )
 
         if self.is_HPC:
             self.pp_num_gpus = project_dict["pp_num_gpus"]
@@ -236,6 +304,9 @@ class DRGVLM_baseConfig:
         self.gradient_clip_norm = 1.0 if project_dict["gradient_clip_norm"] is None else project_dict["gradient_clip_norm"]
         self.amp = True
         self.early_stop_patience = project_dict.get("early_stop_patience", None)
+        self.strict_evaluator_predictions = bool(
+            project_dict.get("strict_evaluator_predictions", True)
+        )
 
         self.learning_rate_dict = {
             "general": 2e-4 if project_dict["general_learning_rate"] is None else project_dict["general_learning_rate"],
@@ -277,7 +348,12 @@ class DRGVLM_baseConfig:
         save_path: str = None,
         filename: str = "config.json",
     ):
-        save_path = save_path if self.save_path is None else self.save_path
+        # An explicit argument must win; otherwise setup_configs() silently
+        # wrote into self.save_path instead of its requested projects directory.
+        save_path = save_path if save_path is not None else self.save_path
+        if save_path is None:
+            raise ValueError("No save_path was provided or configured.")
+        os.makedirs(save_path, exist_ok=True)
         file_path = os.path.join(save_path, filename)
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
@@ -314,10 +390,6 @@ class DRGVLM_baseConfig:
                     save_path=save_path, 
                     filename=filename, 
                 )
-
-
-
-
 
 
 
