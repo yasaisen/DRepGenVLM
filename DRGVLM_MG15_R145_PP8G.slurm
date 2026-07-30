@@ -4,7 +4,7 @@
 #SBATCH --account=MST114560
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=12
-#SBATCH --gpus-per-node=4
+#SBATCH --gpus-per-node=8
 #SBATCH --output=logs/job-%j.out
 #SBATCH --error=logs/job-%j.err
 #SBATCH --mail-type=ALL
