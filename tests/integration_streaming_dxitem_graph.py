@@ -127,11 +127,12 @@ def _streaming_backward(model, case, amp, require_cached_input_grad):
         enabled=amp,
         cache_enabled=False,
     ):
-        case_context = model.prepare_case_loss_context(case)
+        case_contexts = model.prepare_case_loss_context(case)
 
     pair_losses = []
-    dx_count = len(case.DxItem_targets)
-    for dx_item in case.DxItem_targets:
+    active_dx_items = model._active_dxitems(case)
+    dx_count = len(active_dx_items)
+    for dx_item in active_dx_items:
         with torch.autocast(
             device_type="cuda",
             dtype=torch.bfloat16,
@@ -141,7 +142,11 @@ def _streaming_backward(model, case, amp, require_cached_input_grad):
             loss_dict = model.calculate_dxitem_loss(
                 case=case,
                 DxItem=dx_item,
-                case_context=case_context,
+                case_context=(
+                    case_contexts.get(dx_item)
+                    if case_contexts is not None
+                    else None
+                ),
             )
         pair_loss = loss_dict["total_loss"]
         pair_losses.append(float(pair_loss.detach()))
@@ -156,7 +161,7 @@ def _streaming_backward(model, case, amp, require_cached_input_grad):
         "nonfinite_gradients": nonfinite,
         "memory": _memory_result(baselines),
     }
-    del case_context
+    del case_contexts
     return result, gradients
 
 
@@ -260,10 +265,16 @@ def main():
     dataset = multiROI2DxResultDataset.from_config(cfg=cfg, split="valid")
     full_case = dataset[0]
     case = copy(full_case)
-    case.rois = case.rois[:MAX_TEST_ROIS]
-    case.DxItem_targets = dict(
-        list(case.DxItem_targets.items())[:MAX_TEST_DX_ITEMS]
-    )
+    selected_dx_items = list(case.DxItem_rois)[:MAX_TEST_DX_ITEMS]
+    case.DxItem_rois = {
+        dx_item: case.DxItem_rois[dx_item][:MAX_TEST_ROIS]
+        for dx_item in selected_dx_items
+    }
+    case.rois = list({
+        roi.global_idx: roi
+        for rois in case.DxItem_rois.values()
+        for roi in rois
+    }.values())
     model = DownstreamRepGenVLM.from_config(cfg=cfg)
     model.train()
 
@@ -286,9 +297,11 @@ def main():
         require_cached_input_grad=False,
     )
     single_dx_case = copy(case)
-    single_dx_case.DxItem_targets = dict(
-        list(case.DxItem_targets.items())[:1]
-    )
+    single_dx_item = next(iter(case.DxItem_rois))
+    single_dx_case.DxItem_rois = {
+        single_dx_item: case.DxItem_rois[single_dx_item],
+    }
+    single_dx_case.rois = list(case.DxItem_rois[single_dx_item])
     single_leaf_result, single_leaf_gradients = _streaming_backward(
         model=model,
         case=single_dx_case,
@@ -326,7 +339,7 @@ def main():
     result = {
         "case_id": case.case_id,
         "roi_count": len(case.rois),
-        "dx_items": list(case.DxItem_targets),
+        "dx_items": list(case.DxItem_rois),
         "aggregate": aggregate_result,
         "streaming_with_input_leaf": streaming_leaf_result,
         "streaming_without_input_leaf": streaming_no_leaf_result,
@@ -356,7 +369,7 @@ def main():
         ),
         "full_case_streaming_without_input_leaf": {
             "roi_count": len(full_case.rois),
-            "dx_items": list(full_case.DxItem_targets),
+            "dx_items": list(full_case.DxItem_rois),
             **full_case_streaming_result,
         },
     }

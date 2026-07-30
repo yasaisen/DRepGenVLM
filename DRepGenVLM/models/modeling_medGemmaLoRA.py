@@ -33,9 +33,9 @@ class DownstreamRepGenVLM(nn.Module):
     - The VLM backbone (medgemma) is frozen during init, then LoRA adapters are
       injected via peft.  Only LoRA parameters are trainable.
     - Each forward pass handles one (Case, DxItem) pair:
-        user turn  : all ROI images + DxItem name as the question
+        user turn  : ROIs assigned by ROI.DxPair + DxItem question
         assistant  : DxResultTxt as the answer target
-    - calculate_loss iterates over all DxItems for every case in the batch.
+    - calculate_loss iterates only over DxItems with assigned ROIs.
     - generate_outputs uses model.generate() with greedy / beam search.
     """
 
@@ -266,6 +266,58 @@ class DownstreamRepGenVLM(nn.Module):
     # ------------------------------------------------------------------
     # Message building
     # ------------------------------------------------------------------
+    @staticmethod
+    def _active_dxitems(
+        case: Case,
+    ) -> List[str]:
+        dxitem_rois = getattr(case, "DxItem_rois", None)
+        if not isinstance(dxitem_rois, dict):
+            raise AttributeError(
+                f"case_id={case.case_id} has no DxItem_rois mapping. "
+                "Load cases with the DxPair-aware dataset."
+            )
+        return [
+            dx_item
+            for dx_item, rois in dxitem_rois.items()
+            if rois
+        ]
+
+    @staticmethod
+    def _get_dxitem_rois(
+        case: Case,
+        DxItem: str,
+    ) -> List[ROI]:
+        dxitem_rois = getattr(case, "DxItem_rois", None)
+        if not isinstance(dxitem_rois, dict) or DxItem not in dxitem_rois:
+            raise KeyError(
+                f"DxItem={DxItem!r} is not active for case_id={case.case_id}; "
+                f"active={list(dxitem_rois or {})}"
+            )
+        rois = dxitem_rois[DxItem]
+        if not rois:
+            raise ValueError(
+                f"DxItem={DxItem!r} has no assigned ROI for "
+                f"case_id={case.case_id}."
+            )
+        return rois
+
+    @classmethod
+    def _group_dxitems_by_roi_signature(
+        cls,
+        case: Case,
+        dx_items: Optional[List[str]] = None,
+    ) -> List[List[str]]:
+        """Group DxItems only when their ordered ROI inputs are identical."""
+        dx_items = cls._active_dxitems(case) if dx_items is None else dx_items
+        grouped: Dict[Tuple[int, ...], List[str]] = {}
+        for dx_item in dx_items:
+            signature = tuple(
+                roi.global_idx
+                for roi in cls._get_dxitem_rois(case, dx_item)
+            )
+            grouped.setdefault(signature, []).append(dx_item)
+        return list(grouped.values())
+
     def _build_user_content(self,
         case: Case,
         DxItem: str,
@@ -275,7 +327,7 @@ class DownstreamRepGenVLM(nn.Module):
         Layout:  [img, text_sep, img, text_sep, ..., DxItem question]
         """
         content = []
-        for roi in case.rois:
+        for roi in self._get_dxitem_rois(case, DxItem):
             if roi.image is not None:
                 content.append({"type": "image"})
 
@@ -375,7 +427,11 @@ class DownstreamRepGenVLM(nn.Module):
         prompt_only_messages = self._build_inference_messages(case=case, DxItem=DxItem)
         prompt_only = self._apply_chat_template(prompt_only_messages, add_generation_prompt=True)
 
-        images = [roi.image for roi in case.rois if roi.image is not None]
+        images = [
+            roi.image
+            for roi in self._get_dxitem_rois(case, DxItem)
+            if roi.image is not None
+        ]
 
         inputs = self._encode_inputs(text_prompt=full_prompt, images=images)
         prompt_inputs = self._encode_inputs(text_prompt=prompt_only, images=images)
@@ -450,7 +506,8 @@ class DownstreamRepGenVLM(nn.Module):
         return captured["embeds"].to(device=self.device, dtype=self.model_dtype)
 
     def _get_vision_prefix_embeds(self,
-        case,
+        case: Case,
+        DxItem: str,
     ) -> Tuple[
         torch.Tensor,
         int,
@@ -461,8 +518,7 @@ class DownstreamRepGenVLM(nn.Module):
         """One no_grad VLM forward to obtain the shared vision prefix embeddings.
 
         Strategy:
-          1. Build the inference prompt for an arbitrary DxItem (all DxItems share
-             the same ROI images + sep tokens before the question).
+          1. Build the inference prompt for one DxItem's assigned ROI sequence.
           2. Run get_merged_embeds() to capture the full merged sequence.
           3. Use the position of the last sep token (<unused0>) in input_ids to
              locate where the question begins in token space.
@@ -477,10 +533,13 @@ class DownstreamRepGenVLM(nn.Module):
             vision_prefix_attn_mask : (1, V) – cached attention-mask prefix
             vision_prefix_token_type_ids: optional (1, V) Gemma multimodal token types
         """
-        ref_DxItem = next(iter(case.DxItem_targets))
-        messages = self._build_inference_messages(case=case, DxItem=ref_DxItem)
+        messages = self._build_inference_messages(case=case, DxItem=DxItem)
         prompt = self._apply_chat_template(messages, add_generation_prompt=True)
-        images = [roi.image for roi in case.rois if roi.image is not None]
+        images = [
+            roi.image
+            for roi in self._get_dxitem_rois(case, DxItem)
+            if roi.image is not None
+        ]
         ref_inputs = self._encode_inputs(text_prompt=prompt, images=images)
 
         # Capture merged embeddings (no_grad)
@@ -581,7 +640,11 @@ class DownstreamRepGenVLM(nn.Module):
             token_type_ids  : optional (1, S) Gemma multimodal token types
             labels          : (1, S)  – -100 on non-answer positions
         """
-        images = [roi.image for roi in case.rois if roi.image is not None]
+        images = [
+            roi.image
+            for roi in self._get_dxitem_rois(case, DxItem)
+            if roi.image is not None
+        ]
 
         # Full training prompt (user + assistant turn)
         full_messages = self._build_train_messages(case=case, DxItem=DxItem)
@@ -597,7 +660,7 @@ class DownstreamRepGenVLM(nn.Module):
         prompt_len = infer_inputs["input_ids"].shape[1]
 
         # Suffix token IDs: from question start to end of answer + EOS.
-        # q_start_in_ids is shared across all DxItems (vision content is identical).
+        # q_start_in_ids is shared only by DxItems with this exact ROI sequence.
         suffix_ids = full_ids[:, q_start_in_ids:]  # (1, S_suffix)
 
         # Embed suffix using the frozen embed_tokens (no_grad; not in LoRA targets).
@@ -695,30 +758,46 @@ class DownstreamRepGenVLM(nn.Module):
     def prepare_case_loss_context(
         self,
         case: Case,
-    ) -> Optional[Dict[str, Any]]:
-        """Prepare immutable per-case inputs shared by every DxItem.
+        dx_items: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Prepare immutable vision contexts for active DxItems.
 
-        The shared vision prefix is detached and therefore carries no autograd
-        graph.  This lets the trainer backward each DxItem independently without
-        retain_graph=True while still running the frozen vision tower only once.
+        Contexts are shared only between DxItems whose ordered sampled ROI
+        sequences are exactly identical.  Different ROI groups must never reuse
+        a multimodal prefix.
         """
         if not self.use_shared_vision_cache:
             return None
 
-        (
-            vision_prefix_embeds,
-            q_start_in_ids,
-            vision_prefix_len_merged,
-            vision_prefix_attn_mask,
-            vision_prefix_token_type_ids,
-        ) = self._get_vision_prefix_embeds(case)
-        return {
-            "vision_prefix_embeds": vision_prefix_embeds,
-            "q_start_in_ids": q_start_in_ids,
-            "vision_prefix_len_merged": vision_prefix_len_merged,
-            "vision_prefix_attn_mask": vision_prefix_attn_mask,
-            "vision_prefix_token_type_ids": vision_prefix_token_type_ids,
-        }
+        dx_items = self._active_dxitems(case) if dx_items is None else dx_items
+        contexts: Dict[str, Dict[str, Any]] = {}
+        for group_dx_items in self._group_dxitems_by_roi_signature(
+            case,
+            dx_items=dx_items,
+        ):
+            ref_dx_item = group_dx_items[0]
+            (
+                vision_prefix_embeds,
+                q_start_in_ids,
+                vision_prefix_len_merged,
+                vision_prefix_attn_mask,
+                vision_prefix_token_type_ids,
+            ) = self._get_vision_prefix_embeds(
+                case=case,
+                DxItem=ref_dx_item,
+            )
+            context = {
+                "vision_prefix_embeds": vision_prefix_embeds,
+                "q_start_in_ids": q_start_in_ids,
+                "vision_prefix_len_merged": vision_prefix_len_merged,
+                "vision_prefix_attn_mask": vision_prefix_attn_mask,
+                "vision_prefix_token_type_ids": (
+                    vision_prefix_token_type_ids
+                ),
+            }
+            for dx_item in group_dx_items:
+                contexts[dx_item] = context
+        return contexts
 
     def calculate_dxitem_loss(
         self,
@@ -738,12 +817,14 @@ class DownstreamRepGenVLM(nn.Module):
             if case_context is None:
                 raise ValueError(
                     "case_context is required when use_shared_vision_cache=True. "
-                    "Call prepare_case_loss_context(case) once before iterating DxItems."
+                    "Call prepare_case_loss_context(case) before forwarding "
+                    "the active DxItem."
                 )
             log_print(
-                f"case_id={case.case_id}, rois={len(case.rois)}, "
-                f"DxItems={list(case.DxItem_targets.keys())}"
-                f"context_len={case_context['vision_prefix_attn_mask'].shape}, "
+                f"case_id={case.case_id}, DxItem={DxItem}, "
+                f"rois={len(self._get_dxitem_rois(case, DxItem))}, "
+                "context_len="
+                f"{case_context['vision_prefix_attn_mask'].shape}, "
             )
             combined_embeds, attn_mask, token_type_ids, labels = (
                 self.build_train_inputs_with_vision_cache(
@@ -762,8 +843,8 @@ class DownstreamRepGenVLM(nn.Module):
             # cached inputs are detached.  A dummy input leaf is needed only for
             # model topologies such as reentrant gradient checkpointing that
             # explicitly require a grad-bearing input.
-            if self.require_cached_input_grad:
-                combined_embeds = combined_embeds.requires_grad_(True)
+            # if self.require_cached_input_grad:
+            #     combined_embeds = combined_embeds.requires_grad_(True)
             forward_kwargs = {
                 "inputs_embeds": combined_embeds,
                 "attention_mask": attn_mask,
@@ -792,7 +873,9 @@ class DownstreamRepGenVLM(nn.Module):
     # ------------------------------------------------------------------
     def calculate_loss(self,
         batch_cases: List[Case],
-        case_contexts: Optional[Dict[int, Optional[Dict[str, Any]]]] = None,
+        case_contexts: Optional[
+            Dict[int, Optional[Dict[str, Dict[str, Any]]]]
+        ] = None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[int, Dict[str, Any]]]:
         """Return the mean loss for callers that do not stream backward.
 
@@ -805,22 +888,28 @@ class DownstreamRepGenVLM(nn.Module):
         output_case_dict: Dict[int, Dict[str, Any]] = {}
 
         for case in batch_cases:
+            active_dx_items = self._active_dxitems(case)
             log_print(
-                f"case_id={case.case_id}, rois={len(case.rois)}, "
-                f"DxItems={list(case.DxItem_targets.keys())}"
+                f"case_id={case.case_id}, unique_rois={len(case.rois)}, "
+                f"active_DxItems={active_dx_items}"
             )
             output_case_dict[case.global_idx] = {}
-            case_context = (
+            case_context_map = (
                 case_contexts.get(case.global_idx)
                 if case_contexts is not None
                 else self.prepare_case_loss_context(case)
             )
 
-            for DxItem in case.DxItem_targets:
+            for DxItem in active_dx_items:
+                dxitem_context = (
+                    case_context_map.get(DxItem)
+                    if case_context_map is not None
+                    else None
+                )
                 loss_dict = self.calculate_dxitem_loss(
                     case=case,
                     DxItem=DxItem,
-                    case_context=case_context,
+                    case_context=dxitem_context,
                 )
                 all_losses.append(loss_dict["total_loss"])
                 output_case_dict[case.global_idx][DxItem] = {
@@ -854,7 +943,11 @@ class DownstreamRepGenVLM(nn.Module):
             messages,
             add_generation_prompt=True,
         )
-        images = [roi.image for roi in case.rois if roi.image is not None]
+        images = [
+            roi.image
+            for roi in self._get_dxitem_rois(case, DxItem)
+            if roi.image is not None
+        ]
         raw_inputs = self.vlm_processor(
             text=prompt,
             images=images if images else None,
@@ -901,11 +994,11 @@ class DownstreamRepGenVLM(nn.Module):
     def _generate_case_with_vision_cache(
         self,
         case: Case,
+        dx_items: List[str],
         case_context: Dict[str, Any],
         max_new_tokens: int,
         prompt_batch_size: int,
     ) -> Dict[str, Dict[str, str]]:
-        dx_items = list(case.DxItem_targets)
         results: Dict[str, Dict[str, str]] = {}
         vlm = getattr(self, "vlm_model")
         embed_tokens = self._get_embed_tokens()
@@ -1046,7 +1139,11 @@ class DownstreamRepGenVLM(nn.Module):
                 ).strip()
                 results[dx_item] = {
                     "pred_txt": pred_txt,
-                    "gt_txt": case.DxItem_targets[dx_item],
+                    "gt_txt": getattr(
+                        case,
+                        "DxItem_targets",
+                        {},
+                    ).get(dx_item, ""),
                 }
 
         return results
@@ -1058,7 +1155,7 @@ class DownstreamRepGenVLM(nn.Module):
     ) -> Dict[str, Dict[str, str]]:
         results: Dict[str, Dict[str, str]] = {}
         vlm = getattr(self, "vlm_model")
-        for DxItem in case.DxItem_targets:
+        for DxItem in self._active_dxitems(case):
             messages = self._build_inference_messages(
                 case=case,
                 DxItem=DxItem,
@@ -1068,7 +1165,9 @@ class DownstreamRepGenVLM(nn.Module):
                 add_generation_prompt=True,
             )
             images = [
-                roi.image for roi in case.rois if roi.image is not None
+                roi.image
+                for roi in self._get_dxitem_rois(case, DxItem)
+                if roi.image is not None
             ]
             inputs = self._encode_inputs(
                 text_prompt=prompt,
@@ -1092,7 +1191,11 @@ class DownstreamRepGenVLM(nn.Module):
             ).strip()
             results[DxItem] = {
                 "pred_txt": pred_txt,
-                "gt_txt": case.DxItem_targets[DxItem],
+                "gt_txt": getattr(
+                    case,
+                    "DxItem_targets",
+                    {},
+                ).get(DxItem, ""),
             }
         return results
 
@@ -1100,9 +1203,11 @@ class DownstreamRepGenVLM(nn.Module):
     def generate_outputs(self,
         batch_cases: List[Case],
         max_new_tokens: int = 256,
-        case_contexts: Optional[Dict[int, Optional[Dict[str, Any]]]] = None,
+        case_contexts: Optional[
+            Dict[int, Optional[Dict[str, Dict[str, Any]]]]
+        ] = None,
     ) -> Dict[int, Dict[str, Any]]:
-        """Generate all DxItems, batching prompts that share a vision prefix.
+        """Generate active DxItems, batching only identical ROI prefixes.
 
         Returns:
             output_case_dict: {case.global_idx: {DxItem: {"pred_txt": str, "gt_txt": str}}}
@@ -1110,56 +1215,72 @@ class DownstreamRepGenVLM(nn.Module):
         batch_cases = self._normalize_batch(batch_cases)
         output_case_dict: Dict[int, Dict[str, Any]] = {}
         for case in batch_cases:
-            case_context = (
+            active_dx_items = self._active_dxitems(case)
+            case_context_map = (
                 case_contexts.get(case.global_idx)
                 if case_contexts is not None
                 else self.prepare_case_loss_context(case)
             )
-            if self.use_shared_vision_cache and case_context is not None:
-                try:
-                    output_case_dict[case.global_idx] = (
-                        self._generate_case_with_vision_cache(
+            case_results: Dict[str, Dict[str, str]] = {}
+            cache_failed = False
+            if self.use_shared_vision_cache and case_context_map is not None:
+                for group_dx_items in self._group_dxitems_by_roi_signature(
+                    case,
+                    dx_items=active_dx_items,
+                ):
+                    group_context = case_context_map[group_dx_items[0]]
+                    try:
+                        group_results = self._generate_case_with_vision_cache(
                             case=case,
-                            case_context=case_context,
+                            dx_items=group_dx_items,
+                            case_context=group_context,
                             max_new_tokens=max_new_tokens,
                             prompt_batch_size=max(
                                 1,
                                 int(self.eval_prompt_batch_size),
                             ),
                         )
-                    )
-                    continue
-                except (RuntimeError, ValueError, TypeError) as exc:
-                    log_print(
-                        "[VisionCache][WARN] Batched cached generation "
-                        f"failed for case_id={case.case_id}: {exc}. "
-                        "Retrying cached generation with one prompt at a time."
-                    )
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    try:
-                        output_case_dict[case.global_idx] = (
-                            self._generate_case_with_vision_cache(
-                                case=case,
-                                case_context=case_context,
-                                max_new_tokens=max_new_tokens,
-                                prompt_batch_size=1,
-                            )
-                        )
-                        continue
-                    except (RuntimeError, ValueError, TypeError) as retry_exc:
+                    except (RuntimeError, ValueError, TypeError) as exc:
                         log_print(
-                            "[VisionCache][WARN] Sequential cached "
-                            f"generation also failed for case_id="
-                            f"{case.case_id}: {retry_exc}. Falling back to "
-                            "sequential full-VLM generation."
+                            "[VisionCache][WARN] Batched cached generation "
+                            f"failed for case_id={case.case_id}, "
+                            f"DxItems={group_dx_items}: {exc}. Retrying one "
+                            "prompt at a time."
                         )
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
-            output_case_dict[case.global_idx] = self._generate_case_uncached(
-                case=case,
-                max_new_tokens=max_new_tokens,
-            )
+                        try:
+                            group_results = (
+                                self._generate_case_with_vision_cache(
+                                    case=case,
+                                    dx_items=group_dx_items,
+                                    case_context=group_context,
+                                    max_new_tokens=max_new_tokens,
+                                    prompt_batch_size=1,
+                                )
+                            )
+                        except (RuntimeError, ValueError, TypeError) as retry_exc:
+                            log_print(
+                                "[VisionCache][WARN] Sequential cached "
+                                "generation also failed for "
+                                f"case_id={case.case_id}, "
+                                f"DxItems={group_dx_items}: {retry_exc}. "
+                                "Falling back to full-VLM generation."
+                            )
+                            cache_failed = True
+                            break
+                    case_results.update(group_results)
+
+            if (
+                cache_failed
+                or not self.use_shared_vision_cache
+                or case_context_map is None
+            ):
+                case_results = self._generate_case_uncached(
+                    case=case,
+                    max_new_tokens=max_new_tokens,
+                )
+            output_case_dict[case.global_idx] = case_results
 
         return output_case_dict
 
@@ -1293,10 +1414,4 @@ class DownstreamRepGenVLM(nn.Module):
 
         log_print("...Done\n")
         return model
-
-
-
-
-
-
 

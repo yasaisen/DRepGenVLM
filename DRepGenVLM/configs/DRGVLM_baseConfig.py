@@ -19,14 +19,14 @@ from typing import Dict, Optional, List
 PROJECT_MAPPING_DICT = {
     "MG15_basic_overfitTesting": {
         "model_name": "medgemma-1.5-4b-it",
-        "train_ann_file": "[metadata]downstreamRepGenVLM[NAS6test]_v3.2_2607231450.json",
-        "valid_ann_file": "[metadata]downstreamRepGenVLM[NAS6test]_v3.2_2607231450.json",
+        "train_ann_file": "[metadata]downstreamRepGenVLM[NAS6test]_v3.3_2607300507.json",
+        "valid_ann_file": "[metadata]downstreamRepGenVLM[NAS6test]_v3.3_2607300507.json",
         "input_img": True,
         "input_loc": True,
         "level_key": "main_info",
         "batch_size": 1,
         "accumulation_steps": 8,
-        "max_rois_per_case": 30,
+        "max_rois_per_dxitem": 30,
         "roi_sampling_mode": "random_k",
         "valid_sampling_seed": 42,
         "dataloader_seed": 42,
@@ -56,16 +56,16 @@ PROJECT_MAPPING_DICT = {
     # Launch with:  python R27_MVLM_trainDRGVLM_v0.0.py --cfg-path <this_config>
     # (single process, multiple GPUs via device_map)
     # ======================================================== #
-    "MG15_basic_PP4G": {
+    "MG15_only4testing_RX_PP8G": {
         "model_name": "medgemma-1.5-4b-it",
-        "train_ann_file": "[metadata]downstreamRepGenVLM[NAS6train]_v3.2_2607231450.json",
-        "valid_ann_file": "[metadata]downstreamRepGenVLM[NAS6test]_v3.2_2607231450.json",
+        "train_ann_file": "[metadata]downstreamRepGenVLM[NAS6train]_v3.3_2607300507.json",
+        "valid_ann_file": "[metadata]downstreamRepGenVLM[NAS6test]_v3.3_2607300507.json",
         "input_img": True,
         "input_loc": True,
         "level_key": "main_info",
         "batch_size": 1,
         "accumulation_steps": 8,
-        "max_rois_per_case": 145,
+        "max_rois_per_dxitem": 145,
         "roi_sampling_mode": "random_k",
         "valid_sampling_seed": 42,
         "dataloader_seed": 42,
@@ -87,24 +87,24 @@ PROJECT_MAPPING_DICT = {
         "training_mode": "PP",
         "pp_num_gpus": 8,
         "pp_vision_split_index": 0,
-        "attn_implementation": "sdpa",
+        "attn_implementation": "flash_attention_3",
         "use_shared_vision_cache": True,
     },
-    "MG15_basic_R30_PP4G": {
+    "MG15_basic_R145_PP8G": {
         "model_name": "medgemma-1.5-4b-it",
-        "train_ann_file": "[metadata]downstreamRepGenVLM[NAS6train]_v3.2_2607231450.json",
-        "valid_ann_file": "[metadata]downstreamRepGenVLM[NAS6test]_v3.2_2607231450.json",
+        "train_ann_file": "[metadata]downstreamRepGenVLM[NAS6train]_v3.3_2607300507.json",
+        "valid_ann_file": "[metadata]downstreamRepGenVLM[NAS6test]_v3.3_2607300507.json",
         "input_img": True,
         "input_loc": True,
         "level_key": "main_info",
         "batch_size": 1,
         "accumulation_steps": 8,
-        "max_rois_per_case": 30,
+        "max_rois_per_dxitem": 145,
         "roi_sampling_mode": "random_k",
         "valid_sampling_seed": 42,
         "dataloader_seed": 42,
         "use_max_roi_sampler": True,
-        "max_rois_per_batch": 30,
+        "max_rois_per_batch": 145,
         "lora_r": 16,
         "lora_alpha": 32,
         "lora_dropout": 0.05,
@@ -119,9 +119,9 @@ PROJECT_MAPPING_DICT = {
         "warmup_steps": None,
         "early_stop_patience": 20,
         "training_mode": "PP",
-        "pp_num_gpus": 4,
-        "pp_vision_split_index": 14,
-        "attn_implementation": "sdpa",
+        "pp_num_gpus": 8,
+        "pp_vision_split_index": 0,
+        "attn_implementation": "flash_attention_3",
         "use_shared_vision_cache": True,
     },
     # ======================================================== #
@@ -134,7 +134,7 @@ PROJECT_MAPPING_DICT = {
         "level_key": "main_info",
         "batch_size": None,
         "accumulation_steps": None,
-        "max_rois_per_case": None,
+        "max_rois_per_dxitem": None,
         "roi_sampling_mode": None,
         "valid_sampling_seed": 42,
         "dataloader_seed": 42,
@@ -219,11 +219,28 @@ class DRGVLM_baseConfig:
         self.num_batchs_per_epoch = None  # set by datasetHandler
         self.DxItem_list = None           # set by datasetHandler from metadata
 
+        new_roi_limit = project_dict.get("max_rois_per_dxitem", None)
+        legacy_roi_limit = project_dict.get("max_rois_per_case", None)
+        if (
+            new_roi_limit is not None
+            and legacy_roi_limit is not None
+            and int(new_roi_limit) != int(legacy_roi_limit)
+        ):
+            raise ValueError(
+                "Conflicting config values for max_rois_per_dxitem and legacy "
+                "max_rois_per_case."
+            )
+        configured_roi_limit = (
+            new_roi_limit
+            if "max_rois_per_dxitem" in project_dict
+            else legacy_roi_limit
+        )
+
         if self.is_HPC:
-            self.max_rois_per_case = project_dict["max_rois_per_case"]
+            self.max_rois_per_dxitem = configured_roi_limit
             self.roi_sampling_mode = project_dict["roi_sampling_mode"]
         else:
-            self.max_rois_per_case = 2
+            self.max_rois_per_dxitem = 2
             self.roi_sampling_mode = "random_k"
         self.valid_sampling_seed = int(project_dict.get("valid_sampling_seed", 42))
         self.dataloader_seed = int(project_dict.get("dataloader_seed", 42))
@@ -270,8 +287,9 @@ class DRGVLM_baseConfig:
             project_dict.get("eval_prompt_batch_size", 6)
         )
 
-        # Shared vision cache skips re-running the frozen vision tower per DxItem.
-        # Vision LoRA is configured independently and cannot be combined with it.
+        # Vision prefixes may be shared only by DxItems whose sampled ROI
+        # sequences are identical. Vision LoRA remains incompatible with this
+        # detached-prefix cache.
         self.use_shared_vision_cache = bool(project_dict.get("use_shared_vision_cache", True))
         if self.use_shared_vision_cache and self.use_vision_lora:
             raise ValueError(
@@ -371,6 +389,19 @@ class DRGVLM_baseConfig:
         cfg = cls.__new__(cls)
         for key, value in config_dict.items():
             setattr(cfg, key, value)
+        new_roi_limit = getattr(cfg, "max_rois_per_dxitem", None)
+        legacy_roi_limit = getattr(cfg, "max_rois_per_case", None)
+        if (
+            new_roi_limit is not None
+            and legacy_roi_limit is not None
+            and int(new_roi_limit) != int(legacy_roi_limit)
+        ):
+            raise ValueError(
+                "Conflicting config values for max_rois_per_dxitem and legacy "
+                "max_rois_per_case."
+            )
+        if not hasattr(cfg, "max_rois_per_dxitem"):
+            cfg.max_rois_per_dxitem = legacy_roi_limit
         return cfg
 
     @classmethod
@@ -390,9 +421,6 @@ class DRGVLM_baseConfig:
                     save_path=save_path, 
                     filename=filename, 
                 )
-
-
-
 
 
 

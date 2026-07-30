@@ -345,14 +345,22 @@ class DRGVLM_PPTrainer:
         total_dx_count = 0
 
         for case in case_list:
-            n_dx = len(getattr(case, "DxItem_targets", {}))
+            active_dx_items = self.get_model_raw()._active_dxitems(case)
+            n_dx = len(active_dx_items)
             if n_dx == 0:
                 raise RuntimeError(
-                    f"Case has no DxItem targets: case_id={case.case_id}"
+                    f"Case has no active DxItem ROI groups: "
+                    f"case_id={case.case_id}"
                 )
             total_dx_count += n_dx
+            roi_assignment_count = sum(
+                len(self.get_model_raw()._get_dxitem_rois(case, dx_item))
+                for dx_item in active_dx_items
+            )
             case_context_str = (
-                f"case_id={case.case_id}, rois={len(case.rois)}, DxItems={n_dx}"
+                f"case_id={case.case_id}, "
+                f"unique_rois={len(case.rois)}, "
+                f"roi_assignments={roi_assignment_count}, DxItems={n_dx}"
             )
 
             # Shared-vision caching performs a no_grad VLM forward followed by a
@@ -362,43 +370,62 @@ class DRGVLM_PPTrainer:
             uses_shared_vision_cache = bool(
                 getattr(self.get_model_raw(), "use_shared_vision_cache", False)
             )
-            with torch.autocast(
-                device_type="cuda",
-                dtype=torch.bfloat16,
-                enabled=self.amp,
-                cache_enabled=not uses_shared_vision_cache,
-            ):
-                case_context = self.get_model_raw().prepare_case_loss_context(case)
-
             pair_loss_dict_buffer: List[Dict[str, float]] = []
             pair_loss_scale = accumulation_denom * case_count * n_dx
-            for DxItem in case.DxItem_targets:
-                pair_context = f"{case_context_str}, DxItem={DxItem}"
+            dxitem_groups = (
+                self.get_model_raw()._group_dxitems_by_roi_signature(
+                    case,
+                    dx_items=active_dx_items,
+                )
+            )
+            for group_dx_items in dxitem_groups:
                 with torch.autocast(
                     device_type="cuda",
                     dtype=torch.bfloat16,
                     enabled=self.amp,
                     cache_enabled=not uses_shared_vision_cache,
                 ):
-                    loss_dict = self.get_model_raw().calculate_dxitem_loss(
-                        case=case,
-                        DxItem=DxItem,
-                        case_context=case_context,
+                    case_context_map = (
+                        self.get_model_raw().prepare_case_loss_context(
+                            case,
+                            dx_items=group_dx_items,
+                        )
                     )
 
-                self._assert_loss_finite(loss_dict, pair_context)
-                scaled_loss = loss_dict["total_loss"] / pair_loss_scale
-                scaled_loss.backward()
-                pair_loss_dict_buffer.append({
-                    k: float(v.detach().item())
-                    for k, v in loss_dict.items()
-                })
-                del scaled_loss, loss_dict
+                for DxItem in group_dx_items:
+                    pair_context = f"{case_context_str}, DxItem={DxItem}"
+                    dxitem_context = (
+                        case_context_map.get(DxItem)
+                        if case_context_map is not None
+                        else None
+                    )
+                    with torch.autocast(
+                        device_type="cuda",
+                        dtype=torch.bfloat16,
+                        enabled=self.amp,
+                        cache_enabled=not uses_shared_vision_cache,
+                    ):
+                        loss_dict = (
+                            self.get_model_raw().calculate_dxitem_loss(
+                                case=case,
+                                DxItem=DxItem,
+                                case_context=dxitem_context,
+                            )
+                        )
+
+                    self._assert_loss_finite(loss_dict, pair_context)
+                    scaled_loss = loss_dict["total_loss"] / pair_loss_scale
+                    scaled_loss.backward()
+                    pair_loss_dict_buffer.append({
+                        k: float(v.detach().item())
+                        for k, v in loss_dict.items()
+                    })
+                    del scaled_loss, loss_dict
+                del case_context_map
 
             loss_dict_buffer.append(
                 self._mean_float_dict(pair_loss_dict_buffer)
             )
-            del case_context
 
         return self._mean_float_dict(loss_dict_buffer), total_dx_count
 
@@ -438,7 +465,10 @@ class DRGVLM_PPTrainer:
             batch_case_count = len(self._as_case_list(batch))
             self.global_step += 1
             batch_roi_count = sum(
-                len(getattr(case, "rois", []))
+                sum(
+                    len(rois)
+                    for rois in getattr(case, "DxItem_rois", {}).values()
+                )
                 for case in self._as_case_list(batch)
             )
             self.monitor.log_always_on(
@@ -731,8 +761,20 @@ class DRGVLM_PPTrainer:
                 "size_bytes": os.path.getsize(absolute_path),
             }
 
+        max_rois_per_dxitem = getattr(
+            cfg,
+            "max_rois_per_dxitem",
+            None,
+        )
+        if max_rois_per_dxitem is None:
+            max_rois_per_dxitem = getattr(
+                cfg,
+                "max_rois_per_case",
+                None,
+            )
+
         return {
-            "signature_schema_version": 1,
+            "signature_schema_version": 2,
             "metadata": {
                 "train": metadata_signature(
                     getattr(cfg, "train_metadata_path", None)
@@ -747,11 +789,7 @@ class DRGVLM_PPTrainer:
                 "input_img": getattr(cfg, "input_img", True),
                 "input_loc": getattr(cfg, "input_loc", True),
                 "level_key": getattr(cfg, "level_key", "main_info"),
-                "max_rois_per_case": getattr(
-                    cfg,
-                    "max_rois_per_case",
-                    None,
-                ),
+                "max_rois_per_dxitem": max_rois_per_dxitem,
                 "roi_sampling_mode": getattr(
                     cfg,
                     "roi_sampling_mode",
@@ -1645,9 +1683,6 @@ class DRGVLM_PPTrainer:
             trainer.load_checkpoint(path=checkpoint_path)
 
         return trainer
-
-
-
 
 
 

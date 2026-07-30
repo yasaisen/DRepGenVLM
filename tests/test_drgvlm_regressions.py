@@ -10,6 +10,9 @@ from unittest.mock import Mock, patch
 import torch
 import torch.nn.functional as F
 
+from DRepGenVLM.datasets.multiROI2DxResultDataset import (
+    multiROI2DxResultDataset,
+)
 from DRepGenVLM.datasets.maxROI_sampler import MaxROIBatchSampler
 from DRepGenVLM.evaluator.DRGVLMEvaluator import (
     DRGVLMEvaluator,
@@ -56,6 +59,33 @@ def _case(global_idx=1):
 
 
 class EvaluatorCompletenessTests(unittest.TestCase):
+    def test_sparse_case_requires_only_dxitems_with_assigned_rois(self):
+        case = _case()
+        case.DxItem_rois = {
+            "Histologic_Type": [SimpleNamespace(global_idx=10)],
+        }
+        evaluator = DRGVLMEvaluator(
+            DxItem_list=DX_ITEMS,
+            strict_prediction_completeness=True,
+        )
+        evaluator.update(
+            [case],
+            {
+                case.global_idx: {
+                    "Histologic_Type": {
+                        "pred_txt": "Invasive ductal carcinoma",
+                    },
+                },
+            },
+        )
+        _, summary = evaluator._evaluate()
+        completeness = summary["prediction_completeness"]
+        self.assertEqual(completeness["expected_prediction_count"], 1)
+        self.assertEqual(completeness["missing_prediction_count"], 0)
+        self.assertIsNone(
+            summary["per_DxItem"]["Histologic_Grade"]["exact_match"]
+        )
+
     def test_strict_mode_rejects_missing_predictions(self):
         evaluator = DRGVLMEvaluator(
             DxItem_list=DX_ITEMS,
@@ -344,6 +374,50 @@ class SharedVisionGenerationTests(unittest.TestCase):
         def decode(token_ids, skip_special_tokens=True):
             return f"prediction-{int(token_ids[0])}"
 
+    def test_prompt_contains_only_rois_assigned_to_requested_dxitem(self):
+        model = DownstreamRepGenVLM(device="cpu")
+        model.sep_str = "<sep>"
+        model.boc_str = "<boc>"
+        roi_0 = SimpleNamespace(
+            global_idx=0,
+            image=None,
+            mpp=None,
+            cxcywh=None,
+        )
+        roi_1 = SimpleNamespace(
+            global_idx=1,
+            image=None,
+            mpp=None,
+            cxcywh=None,
+        )
+        case = SimpleNamespace(
+            case_id="case-prompts",
+            DxItem_rois={
+                "DxA": [roi_0, roi_1],
+                "DxB": [roi_1],
+            },
+        )
+        content_a = model._build_user_content(case, "DxA")
+        content_b = model._build_user_content(case, "DxB")
+        self.assertEqual(len(content_a), 3)
+        self.assertEqual(len(content_b), 2)
+
+    def test_only_identical_ordered_roi_groups_share_a_cache_group(self):
+        roi_0 = SimpleNamespace(global_idx=0)
+        roi_1 = SimpleNamespace(global_idx=1)
+        case = SimpleNamespace(
+            case_id="case-signatures",
+            DxItem_rois={
+                "DxA": [roi_0, roi_1],
+                "DxB": [roi_0, roi_1],
+                "DxC": [roi_1, roi_0],
+            },
+        )
+        self.assertEqual(
+            DownstreamRepGenVLM._group_dxitems_by_roi_signature(case),
+            [["DxA", "DxB"], ["DxC"]],
+        )
+
     def test_six_prompts_share_one_batched_generate_call(self):
         model = DownstreamRepGenVLM(device="cpu")
         model.vlm_model = self.FakeGenerator()
@@ -386,6 +460,7 @@ class SharedVisionGenerationTests(unittest.TestCase):
         }
         outputs = model._generate_case_with_vision_cache(
             case=case,
+            dx_items=list(case.DxItem_targets),
             case_context=context,
             max_new_tokens=4,
             prompt_batch_size=6,
@@ -550,6 +625,122 @@ class CausalAttentionTests(unittest.TestCase):
 
 
 
+class DxPairAwareDatasetTests(unittest.TestCase):
+    @staticmethod
+    def _metadata(dx_pairs=None):
+        dx_pairs = (
+            [
+                {"DxA": None, "DxB": None},
+                {"DxA": None},
+                {"DxA": None},
+                {"DxB": None},
+            ]
+            if dx_pairs is None
+            else dx_pairs
+        )
+        rois = [
+            {
+                "global_idx": roi_idx,
+                "DxPair": dx_pair,
+                "main_info": {
+                    "roi_path": None,
+                    "mpp": 1.0,
+                    "roi_wh": [10, 10],
+                    "cxcywh": [0.5, 0.5, 0.1, 0.1],
+                },
+            }
+            for roi_idx, dx_pair in enumerate(dx_pairs)
+        ]
+        return {
+            "DxItem_list": ["DxA", "DxB", "DxWithoutROI"],
+            "case_list": [{
+                "sample_idx": 7,
+                "case_id": "case-7",
+                "tissue_blocks": [{
+                    "stains": [{"roi_list": rois}],
+                }],
+                "structured_report": {
+                    "DxItems": {
+                        dx_item: {
+                            "DxResultTxt": f"target-{dx_item}",
+                            "DxResultCls": f"class-{dx_item}",
+                        }
+                        for dx_item in (
+                            "DxA",
+                            "DxB",
+                            "DxWithoutROI",
+                        )
+                    },
+                },
+            }],
+        }
+
+    @staticmethod
+    def _dataset(directory, metadata, **kwargs):
+        metadata_path = Path(directory) / "metadata.json"
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        return multiROI2DxResultDataset(
+            image_path=directory,
+            metadata_path=str(metadata_path),
+            split="valid",
+            input_img=False,
+            input_loc=False,
+            max_rois_per_dxitem=2,
+            roi_sampling_mode="head_k",
+            **kwargs,
+        )
+
+    def test_dxpair_keys_control_per_dxitem_sampling_and_forward_membership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = self._dataset(directory, self._metadata())
+            case = dataset[0]
+
+        self.assertEqual(
+            [roi.global_idx for roi in case.DxItem_rois["DxA"]],
+            [0, 1],
+        )
+        self.assertEqual(
+            [roi.global_idx for roi in case.DxItem_rois["DxB"]],
+            [0, 3],
+        )
+        self.assertNotIn("DxWithoutROI", case.DxItem_rois)
+        self.assertIn("DxWithoutROI", case.DxItem_targets)
+        self.assertEqual(
+            [roi.global_idx for roi in case.rois],
+            [0, 1, 3],
+        )
+        self.assertEqual(dataset.get_raw_roi_count(0), 5)
+        self.assertEqual(dataset.get_effective_roi_count(0), 4)
+
+    def test_invalid_dxpair_relationships_fail_during_dataset_construction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metadata = self._metadata(dx_pairs=[{"Undeclared": None}])
+            with self.assertRaisesRegex(ValueError, "undeclared DxItem"):
+                self._dataset(directory, metadata)
+
+        with tempfile.TemporaryDirectory() as directory:
+            metadata = self._metadata(dx_pairs=[None, {}, None])
+            with self.assertRaisesRegex(ValueError, "no active DxItem"):
+                self._dataset(directory, metadata)
+
+    def test_legacy_roi_limit_alias_conflict_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metadata_path = Path(directory) / "metadata.json"
+            metadata_path.write_text(
+                json.dumps(self._metadata()),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "Conflicting ROI limits"):
+                multiROI2DxResultDataset(
+                    image_path=directory,
+                    metadata_path=str(metadata_path),
+                    split="valid",
+                    input_img=False,
+                    max_rois_per_dxitem=2,
+                    max_rois_per_case=3,
+                )
+
+
 class ROIBatchSamplerTests(unittest.TestCase):
     def test_budget_is_applied_per_yielded_batch(self):
         roi_counts = [40, 30, 20]
@@ -593,9 +784,24 @@ class _StreamingPairLossModel(torch.nn.Module):
         self.forwarded_pairs = []
         self.backward_pairs = []
 
-    def prepare_case_loss_context(self, case):
+    @staticmethod
+    def _active_dxitems(case):
+        return DownstreamRepGenVLM._active_dxitems(case)
+
+    @staticmethod
+    def _get_dxitem_rois(case, DxItem):
+        return DownstreamRepGenVLM._get_dxitem_rois(case, DxItem)
+
+    @staticmethod
+    def _group_dxitems_by_roi_signature(case, dx_items=None):
+        return DownstreamRepGenVLM._group_dxitems_by_roi_signature(
+            case,
+            dx_items=dx_items,
+        )
+
+    def prepare_case_loss_context(self, case, dx_items=None):
         self.prepared_case_ids.append(case.case_id)
-        return {"case_id": case.case_id}
+        return None
 
     def calculate_dxitem_loss(self, case, DxItem, case_context=None):
         if len(self.forwarded_pairs) != len(self.backward_pairs):
@@ -614,16 +820,21 @@ class _StreamingPairLossModel(torch.nn.Module):
 
     @staticmethod
     def assert_context(case, case_context):
-        if case_context != {"case_id": case.case_id}:
-            raise AssertionError("Per-case loss context was not reused correctly.")
+        if case_context is not None:
+            raise AssertionError("Unexpected cached context for uncached model.")
 
 
 class StreamingDxItemBackwardTests(unittest.TestCase):
     @staticmethod
     def _case(case_id, loss_coefficients):
+        shared_roi = SimpleNamespace(global_idx=0)
         return SimpleNamespace(
             case_id=case_id,
-            rois=[],
+            rois=[shared_roi],
+            DxItem_rois={
+                dx_item: [shared_roi]
+                for dx_item in loss_coefficients
+            },
             DxItem_targets={
                 dx_item: f"target-{dx_item}"
                 for dx_item in loss_coefficients
@@ -741,6 +952,9 @@ class CachedInputGradientPolicyTests(unittest.TestCase):
         model = self._model()
         case = SimpleNamespace(
             case_id="case-a",
+            DxItem_rois={
+                "Histologic_Type": [SimpleNamespace(global_idx=0)],
+            },
             DxItem_targets={"Histologic_Type": "target"},
         )
 
@@ -759,6 +973,9 @@ class CachedInputGradientPolicyTests(unittest.TestCase):
         model.require_cached_input_grad = True
         case = SimpleNamespace(
             case_id="case-a",
+            DxItem_rois={
+                "Histologic_Type": [SimpleNamespace(global_idx=0)],
+            },
             DxItem_targets={"Histologic_Type": "target"},
         )
 

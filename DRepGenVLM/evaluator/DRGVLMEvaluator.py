@@ -485,7 +485,23 @@ class DRGVLMEvaluator:
                 )
                 case_outputs = {}
 
-            unexpected_dx_items = set(case_outputs) - expected_dx_items
+            dxitem_rois = getattr(case, "DxItem_rois", None)
+            if isinstance(dxitem_rois, dict):
+                case_expected_dx_items = {
+                    dx_item
+                    for dx_item, rois in dxitem_rois.items()
+                    if rois and dx_item in expected_dx_items
+                }
+            else:
+                # Compatibility for recomputing legacy saved evaluator records.
+                case_expected_dx_items = (
+                    set(getattr(case, "DxItem_targets", {}))
+                    & expected_dx_items
+                )
+
+            unexpected_dx_items = (
+                set(case_outputs) - case_expected_dx_items
+            )
             if unexpected_dx_items:
                 local_counts["unexpected_output_count"] += len(
                     unexpected_dx_items
@@ -504,6 +520,8 @@ class DRGVLMEvaluator:
                 ),
             }
             for dx_item in self.DxItem_list:
+                if dx_item not in case_expected_dx_items:
+                    continue
                 local_counts["expected_prediction_count"] += 1
                 pred_info = case_outputs.get(dx_item)
                 prediction_present = isinstance(pred_info, dict)
@@ -596,7 +614,9 @@ class DRGVLMEvaluator:
         for entry in self.cases_list:
             case_dx_dict: Dict[str, Any] = {}
             for dx_item in self.DxItem_list:
-                texts = entry["DxItem_dict"][dx_item]
+                texts = entry["DxItem_dict"].get(dx_item)
+                if not isinstance(texts, dict):
+                    continue
                 pred_txt = texts["pred_txt"]
                 gt_txt = texts["gt_txt"]
                 prediction_present = bool(texts["prediction_present"])

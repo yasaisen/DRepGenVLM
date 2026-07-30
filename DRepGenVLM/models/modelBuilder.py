@@ -296,42 +296,41 @@ class modelBuilder:
                 text_gpu_indices = list(range(1, num_gpus))
             elif num_gpus >= 6:
                 if project_name == "CLEE" and model_name == "medgemma-1.5-4b-it":
-                    device_map["model.vision_tower.embeddings"] = "cuda:0"
-                    for layer_idx in range(int(num_vision_layers)):
-                        device_map[f"model.vision_tower.encoder.layers.{layer_idx}"] = "cuda:0" if layer_idx < vision_split_index else "cuda:1"
                     device_map.update({
-                        "model.vision_tower.post_layernorm": "cuda:1",
-                        "model.multi_modal_projector": "cuda:1",
-                        "model.language_model.embed_tokens": "cuda:1",
-                        "model.language_model.norm": "cuda:1",
-                        "lm_head": "cuda:1",
+                        "model.vision_tower": "cuda:0",
+                        "model.multi_modal_projector": "cuda:0",
+                        "model.language_model.embed_tokens": "cuda:0",
+                        "model.language_model.norm": "cuda:0",
+                        "lm_head": "cuda:0",
                     })
+                    text_gpu_indices = list(range(1, num_gpus))
                 elif project_name == "CLEE" and model_name == "gemma-4-E4B-it":
-                    device_map["vision_tower.patch_embedder"] = "cuda:0"
                     for layer_idx in range(int(num_vision_layers)):
                         device_map[f"vision_tower.encoder.layers.{layer_idx}"] = "cuda:0" if layer_idx < vision_split_index else "cuda:1"
                     device_map.update({
+                        "vision_tower.patch_embedder": "cuda:1",
                         "embed_vision": "cuda:1",
                         "language_model.embed_tokens": "cuda:1",
                         "language_model.embed_tokens_per_layer": "cuda:1",
                         "language_model.per_layer_model_projection": "cuda:1",
                     })
+                    text_gpu_indices = list(range(2, num_gpus))
                 elif project_name == "DRGVLM" and model_name == "medgemma-1.5-4b-it":
-                    device_map["model.vision_tower.embeddings"] = "cuda:0"
                     for layer_idx in range(int(num_vision_layers)):
                         device_map[f"model.vision_tower.encoder.layers.{layer_idx}"] = "cuda:0" if layer_idx < vision_split_index else "cuda:1"
                     device_map.update({
+                        "model.vision_tower.embeddings": "cuda:1",
                         "model.vision_tower.post_layernorm": "cuda:1",
                         "model.multi_modal_projector": "cuda:1",
                         "model.language_model.embed_tokens": "cuda:1",
                         "model.language_model.norm": "cuda:1",
                         "lm_head": "cuda:1",
                     })
+                    text_gpu_indices = list(range(2, num_gpus))
                 else:
                     raise ValueError(
                         f"Unsupported project_name/model_name combination: {project_name}/{model_name}"
                     )
-                text_gpu_indices = list(range(2, num_gpus))
             else:
                 raise ValueError(
                     f"The {project_name} PP policy currently supports 1-8 "

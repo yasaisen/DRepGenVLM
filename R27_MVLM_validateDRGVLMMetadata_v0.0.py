@@ -339,17 +339,6 @@ def validate_metadata(
             split=split,
         )
 
-    missing_grade_items = sorted(
-        set(REQUIRED_GRADE_ITEMS) - set(declared_dx_items)
-    )
-    if missing_grade_items:
-        report.add(
-            "error",
-            "REQUIRED_DXITEM_NOT_DECLARED",
-            f"DxItem_list is missing {missing_grade_items}",
-            split=split,
-        )
-
     case_list = metadata.get("case_list")
     if not isinstance(case_list, list):
         report.add(
@@ -434,13 +423,23 @@ def validate_metadata(
             )
             dx_items = {}
 
-        for dx_item in declared_dx_items:
-            dx_sample = dx_items.get(dx_item)
+        for dx_item, dx_sample in dx_items.items():
+            if dx_item not in declared_dx_items:
+                report.add(
+                    "error",
+                    "UNDECLARED_DXITEM_TARGET",
+                    f"Target DxItem {dx_item!r} is absent from DxItem_list",
+                    split=split,
+                    case_id=case_id,
+                    sample_idx=sample_idx,
+                    location=f"structured_report.DxItems.{dx_item}",
+                )
+                continue
             if not isinstance(dx_sample, dict):
                 report.add(
                     "error",
-                    "DXITEM_MISSING",
-                    f"Declared DxItem {dx_item!r} is absent or not an object",
+                    "INVALID_DXITEM_TARGET",
+                    f"Target DxItem {dx_item!r} must be an object",
                     split=split,
                     case_id=case_id,
                     sample_idx=sample_idx,
@@ -465,10 +464,7 @@ def validate_metadata(
             if isinstance(cls_value, str):
                 dx_class_counts[dx_item][cls_value] += 1
 
-        if all(
-            isinstance(dx_items.get(item), dict)
-            for item in REQUIRED_GRADE_ITEMS
-        ):
+        if "Histologic_Grade" in dx_items:
             _validate_grade_classes(
                 report,
                 dx_items,
@@ -490,6 +486,7 @@ def validate_metadata(
             continue
 
         case_roi_count = 0
+        active_dx_items: Set[str] = set()
         for block_idx, block in enumerate(tissue_blocks):
             stains = block.get("stains") if isinstance(block, dict) else None
             if not isinstance(stains, list):
@@ -561,12 +558,10 @@ def validate_metadata(
                         )
                     roi_indices.add(global_idx_key)
 
-                    if "DxPair" in roi and not isinstance(
-                        roi.get("DxPair"),
-                        (dict, type(None)),
-                    ):
+                    dx_pair = roi.get("DxPair")
+                    if dx_pair is not None and not isinstance(dx_pair, dict):
                         report.add(
-                            "warning",
+                            "error",
                             "INVALID_DXPAIR",
                             "DxPair should be an object or null",
                             split=split,
@@ -574,6 +569,38 @@ def validate_metadata(
                             sample_idx=sample_idx,
                             location=f"{roi_location}.DxPair",
                         )
+                    elif isinstance(dx_pair, dict):
+                        for dx_item in dx_pair:
+                            if dx_item not in declared_dx_items:
+                                report.add(
+                                    "error",
+                                    "UNDECLARED_DXPAIR_ITEM",
+                                    (
+                                        f"DxPair references {dx_item!r}, which "
+                                        "is absent from DxItem_list"
+                                    ),
+                                    split=split,
+                                    case_id=case_id,
+                                    sample_idx=sample_idx,
+                                    location=f"{roi_location}.DxPair",
+                                )
+                                continue
+                            if not isinstance(dx_items.get(dx_item), dict):
+                                report.add(
+                                    "error",
+                                    "DXPAIR_TARGET_MISSING",
+                                    (
+                                        f"DxPair references {dx_item!r}, but "
+                                        "structured_report.DxItems has no "
+                                        "matching target"
+                                    ),
+                                    split=split,
+                                    case_id=case_id,
+                                    sample_idx=sample_idx,
+                                    location=f"{roi_location}.DxPair",
+                                )
+                                continue
+                            active_dx_items.add(dx_item)
 
                     if level_key not in roi:
                         report.add(
@@ -604,6 +631,15 @@ def validate_metadata(
                 "warning",
                 "CASE_WITHOUT_ROI",
                 "Case has no ROI records",
+                split=split,
+                case_id=case_id,
+                sample_idx=sample_idx,
+            )
+        if not active_dx_items:
+            report.add(
+                "error",
+                "CASE_WITHOUT_ACTIVE_DXITEM",
+                "No ROI DxPair assigns this case to a valid DxItem",
                 split=split,
                 case_id=case_id,
                 sample_idx=sample_idx,

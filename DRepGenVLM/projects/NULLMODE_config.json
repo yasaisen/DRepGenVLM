@@ -1,7 +1,7 @@
 {
   "project_name": "NULLMODE",
   "is_HPC": false,
-  "factory_timestamp": "2607290304",
+  "factory_timestamp": "2607310447",
   "localGPU_image_path": "/media/yasaisen/NAS8/for_research/datasets/WSI_fromNAS",
   "localGPU_metadata_path": "/media/yasaisen/NAS8/for_research/metadatas",
   "localGPU_weight_path": "/media/yasaisen/NAS8/for_research/weights",
@@ -22,7 +22,7 @@
   "prefetch_factor": null,
   "num_batchs_per_epoch": null,
   "DxItem_list": null,
-  "max_rois_per_case": 2,
+  "max_rois_per_dxitem": 2,
   "roi_sampling_mode": "random_k",
   "valid_sampling_seed": 42,
   "dataloader_seed": 42,
