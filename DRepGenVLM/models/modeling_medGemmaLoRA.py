@@ -27,18 +27,6 @@ SYSTEM_PROMPT = ""
 
 
 class DownstreamRepGenVLM(nn.Module):
-    """medgemma-1.5-4b-it + LoRA SFT model for diagnostic report generation.
-
-    Design:
-    - The VLM backbone (medgemma) is frozen during init, then LoRA adapters are
-      injected via peft.  Only LoRA parameters are trainable.
-    - Each forward pass handles one (Case, DxItem) pair:
-        user turn  : ROIs assigned by ROI.DxPair + DxItem question
-        assistant  : DxResultTxt as the answer target
-    - calculate_loss iterates only over DxItems with assigned ROIs.
-    - generate_outputs uses model.generate() with greedy / beam search.
-    """
-
     def __init__(self,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):

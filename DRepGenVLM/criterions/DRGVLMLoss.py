@@ -20,23 +20,12 @@ from ..common.utils import log_print, _debug_print
 
 
 class DRGVLMLoss(nn.Module):
-    """Causal LM cross-entropy loss for the DRGVLM SFT framework.
-
-    Behaviour:
-    - Receives logits (B, S, V) and labels (B, S) where user tokens are -100.
-    - Applies standard cross-entropy with ignore_index=-100, shifted by 1 for
-      next-token prediction (labels shifted left, logits shifted right).
-    """
-
     def __init__(self,
         label_smoothing: float = 0.0,
     ):
         super().__init__()
         self.label_smoothing = float(label_smoothing)
 
-    # ------------------------------------------------------------------
-    # Finite-check helpers (mirrors CLEELoss style)
-    # ------------------------------------------------------------------
     @staticmethod
     def _finite_summary(tensor: torch.Tensor) -> str:
         flat = tensor.detach().reshape(-1)
@@ -62,15 +51,11 @@ class DRGVLMLoss(nn.Module):
                 f"Non-finite tensor in DRGVLMLoss: {name}. {context}. {self._finite_summary(tensor)}"
             )
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
     def forward(self,
         logits: torch.Tensor,   # (B, S, V)  – raw unnormalised logits
         labels: torch.Tensor,   # (B, S)     – -100 for ignored positions
         context: str = "",
     ) -> Dict[str, torch.Tensor]:
-        """Compute next-token CE loss; returns dict with 'total_loss'."""
         if logits.ndim != 3:
             raise ValueError(f"logits must be 3-D (B, S, V), got shape={tuple(logits.shape)}.")
         if labels.ndim != 2:

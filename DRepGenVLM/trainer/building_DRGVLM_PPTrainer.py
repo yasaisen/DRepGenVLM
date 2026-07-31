@@ -6,22 +6,6 @@
  See the LICENSE file in the project root for more information.
 
  last modified in 2607081524
-
- Pipeline Parallelism (PP) Trainer for DRGVLM.
-
- Design principles
- -----------------
- * Single-process, multi-GPU: the VLM backbone is split across N GPUs via a
-   manual device_map built in modelBuilder.py.  No torch.distributed / DDP.
-
- * Trainable parameters are only the LoRA adapter weights.  They are on
-   self.device ("cuda:0") after peft wrapping.
-
- * Loss is computed per (case, DxItem) pair; each loss.backward() is called
-   immediately (no graph accumulation across pairs) to keep peak memory low.
-
- * Validation runs generate_outputs() for every case every epoch, then calls
-   DRGVLMEvaluator to compute text-generation metrics (BLEU, token-F1, etc.).
 """
 
 
@@ -54,12 +38,6 @@ from ..common.utils import log_print, _debug_print
 
 
 class DRGVLM_PPTrainer:
-    """DRGVLM trainer using Pipeline Parallelism (single process, N GPUs).
-
-    The VLM backbone is spread across N GPUs via device_map.
-    Only LoRA adapter parameters are trainable; they reside on self.device.
-    """
-
     def __init__(self,
         model: nn.Module,
         device: str = None,

@@ -1,14 +1,11 @@
-"""DRGVLM report-generation inference for DxPair-aware metadata.
+"""
+ SPDX-License-Identifier: MIT
+ Copyright (c) 2026, yasaisen (clover)
 
-Run from the project root with::
+ This file is part of a project licensed under the MIT License.
+ See the LICENSE file in the project root for more information.
 
-    python -m DRepGenVLM.pipeline.drgvlmInferencePipeline \
-        --checkpoint-dir /path/to/checkpoint \
-        --input-metadata /path/to/input.json \
-        --output-metadata /path/to/output.json
-
-The input may omit ``structured_report`` entirely.  A generated report is
-written only for DxItems activated by at least one ROI ``DxPair`` key.
+ last modified in 2607081524
 """
 
 from __future__ import annotations
