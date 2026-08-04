@@ -318,6 +318,13 @@ class DRGVLM_baseConfig:
 
         self.weight_filename = "best_model.pth"
         self.save_freq = 5
+        checkpoint_interval = project_dict.get(
+            "checkpoint_every_n_optimizer_steps",
+            100,
+        )
+        self.checkpoint_every_n_optimizer_steps = (
+            0 if checkpoint_interval is None else max(0, int(checkpoint_interval))
+        )
         self.plot_freq = 5
         self.gradient_clip_norm = 1.0 if project_dict["gradient_clip_norm"] is None else project_dict["gradient_clip_norm"]
         self.amp = True
@@ -421,6 +428,5 @@ class DRGVLM_baseConfig:
                     save_path=save_path, 
                     filename=filename, 
                 )
-
 
 

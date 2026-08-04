@@ -53,6 +53,7 @@ class DRGVLM_PPTrainer:
         amp: bool = False,
         accumulation_steps: int = None,
         max_new_tokens: int = 256,
+        checkpoint_every_n_optimizer_steps: Optional[int] = 100,
     ):
         raw_device = device or "cuda:0"
         if raw_device == "cuda":
@@ -78,6 +79,11 @@ class DRGVLM_PPTrainer:
 
         self.amp = amp
         self.accumulation_steps = max(1, int(accumulation_steps)) if accumulation_steps is not None else 1
+        self.checkpoint_every_n_optimizer_steps = (
+            max(0, int(checkpoint_every_n_optimizer_steps))
+            if checkpoint_every_n_optimizer_steps is not None
+            else 0
+        )
 
         self.checkpoint_epoch_idx = None
         self.global_step = 0
@@ -92,7 +98,9 @@ class DRGVLM_PPTrainer:
         self.current_resume_signature: Dict[str, Any] = {}
         self._loaded_resume_signature: Optional[Dict[str, Any]] = None
         self._pending_train_generator_state = None
+        self._pending_train_progress: Optional[Dict[str, Any]] = None
         self._active_train_generator = None
+        self._active_train_progress: Optional[Dict[str, Any]] = None
         self._snapshot_cache_key = None
         self._snapshot_cache_path = None
 
@@ -309,6 +317,36 @@ class DRGVLM_PPTrainer:
         block_start = (int(batch_idx) // accumulation_steps) * accumulation_steps
         return max(1, min(accumulation_steps, int(num_batches) - block_start))
 
+    @staticmethod
+    def _snapshot_train_batch_sampler_cache(
+        dataloader: DataLoader,
+    ) -> Optional[List[List[int]]]:
+        """Copy a sampler's cached epoch plan when it exposes one."""
+        batch_sampler = getattr(dataloader, "batch_sampler", None)
+        cached_batches = getattr(batch_sampler, "_cached_batches", None)
+        if cached_batches is None:
+            return None
+        return [list(batch) for batch in cached_batches]
+
+    @staticmethod
+    def _restore_train_batch_sampler_cache(
+        dataloader: DataLoader,
+        cached_batches: Optional[List[List[int]]],
+    ):
+        """Restore the cached epoch plan used by MaxROIBatchSampler."""
+        if cached_batches is None:
+            return
+        batch_sampler = getattr(dataloader, "batch_sampler", None)
+        if not hasattr(batch_sampler, "_cached_batches"):
+            raise RuntimeError(
+                "In-epoch checkpoint contains a cached batch plan, but the "
+                "current DataLoader batch sampler cannot restore it."
+            )
+        batch_sampler._cached_batches = [
+            list(batch)
+            for batch in cached_batches
+        ]
+
     # ------------------------------------------------------------------
     # Train one batch (gradient accumulation aware)
     # ------------------------------------------------------------------
@@ -413,18 +451,73 @@ class DRGVLM_PPTrainer:
     def epoch_train(self,
         dataloader: DataLoader,
         epoch_idx: int,
+        resume_batch_idx: int = 0,
+        resume_epoch_losses: Optional[List[float]] = None,
     ) -> float:
         self.get_model_raw().train()
         self.monitor.reset_phase(
             phase="train",
             global_step=self.global_step,
         )
-        epoch_losses: List[float] = []
+        resume_batch_idx = int(resume_batch_idx)
+        epoch_losses = [
+            float(loss)
+            for loss in (resume_epoch_losses or [])
+        ]
+        if len(epoch_losses) != resume_batch_idx:
+            raise RuntimeError(
+                "In-epoch checkpoint loss history does not match its next "
+                f"batch index: losses={len(epoch_losses)}, "
+                f"next_batch_idx={resume_batch_idx}."
+            )
+
+        epoch_start_train_generator_state = None
+        if self._active_train_generator is not None:
+            epoch_start_train_generator_state = (
+                self._active_train_generator.get_state().clone()
+            )
         num_batches = len(dataloader)
+        epoch_batch_sampler_cache = self._snapshot_train_batch_sampler_cache(
+            dataloader
+        )
+        if resume_batch_idx < 0 or resume_batch_idx > num_batches:
+            raise RuntimeError(
+                "In-epoch checkpoint next_batch_idx must identify an "
+                f"unfinished batch, got {resume_batch_idx} for "
+                f"{num_batches} batches."
+            )
+        if num_batches == 0:
+            if resume_batch_idx != 0:
+                raise RuntimeError(
+                    "Cannot resume a nonzero batch index from an empty "
+                    "DataLoader."
+                )
+            self._active_train_progress = None
+            return float(np.mean(epoch_losses)) if epoch_losses else 0.0
+        if resume_batch_idx == num_batches:
+            raise RuntimeError(
+                "In-epoch checkpoint marks every batch complete. Use the "
+                "corresponding end-of-epoch checkpoint instead."
+            )
+        if resume_batch_idx % self.accumulation_steps != 0:
+            raise RuntimeError(
+                "In-epoch checkpoint must resume at an accumulation boundary, "
+                f"got next_batch_idx={resume_batch_idx} with "
+                f"accumulation_steps={self.accumulation_steps}."
+            )
+
         pbar = tqdm(dataloader, desc=f"Epoch {epoch_idx} [Train]")
+        if resume_batch_idx:
+            log_print(
+                "Resuming incomplete epoch "
+                f"{epoch_idx} from batch {resume_batch_idx}/{num_batches}."
+            )
 
         self.optimizer.zero_grad(set_to_none=True)
         for batch_idx, batch in enumerate(pbar):
+            if batch_idx < resume_batch_idx:
+                continue
+
             is_last_batch = (batch_idx + 1 == num_batches)
             is_accum_step = ((batch_idx + 1) % self.accumulation_steps == 0) or is_last_batch
 
@@ -504,6 +597,44 @@ class DRGVLM_PPTrainer:
                 "DxPairs": total_dx_count,
             })
 
+            should_save_in_epoch = (
+                is_accum_step
+                and not is_last_batch
+                and self.checkpoint_every_n_optimizer_steps > 0
+                and (
+                    self.optimizer_step
+                    % self.checkpoint_every_n_optimizer_steps
+                    == 0
+                )
+            )
+            if should_save_in_epoch:
+                if epoch_start_train_generator_state is None:
+                    raise RuntimeError(
+                        "In-epoch checkpointing requires an explicit train "
+                        "DataLoader generator for exact continuation."
+                    )
+                self._active_train_progress = {
+                    "epoch_idx": int(epoch_idx),
+                    "next_batch_idx": int(batch_idx + 1),
+                    "epoch_losses": list(epoch_losses),
+                    "epoch_start_train_generator_state": (
+                        epoch_start_train_generator_state.clone()
+                        if epoch_start_train_generator_state is not None
+                        else None
+                    ),
+                    "epoch_batch_sampler_cache": (
+                        [list(batch) for batch in epoch_batch_sampler_cache]
+                        if epoch_batch_sampler_cache is not None
+                        else None
+                    ),
+                }
+                self.save_checkpoint(
+                    epoch_idx=epoch_idx,
+                    weight_filename="latest_model.pth",
+                )
+                self._active_train_progress = None
+
+        self._active_train_progress = None
         return float(np.mean(epoch_losses)) if epoch_losses else 0.0
 
     # ------------------------------------------------------------------
@@ -879,8 +1010,8 @@ class DRGVLM_PPTrainer:
                 self._pending_train_generator_state
             )
             log_print(
-                "Restored train DataLoader generator state for exact "
-                "sampler/worker-seed continuation."
+                "Restored train DataLoader generator state for sampler/worker "
+                "seed continuation."
             )
 
     def train(self,
@@ -894,8 +1025,52 @@ class DRGVLM_PPTrainer:
             checkpoint_epoch_idx=checkpoint_epoch_idx,
         )
 
-        for epoch_idx in range(checkpoint_epoch_idx + 1, self.num_epochs):
-            train_loss = self.epoch_train(train_dataloader, epoch_idx=epoch_idx)
+        resume_train_progress = self._pending_train_progress
+        if resume_train_progress is not None:
+            resume_epoch_idx = int(resume_train_progress["epoch_idx"])
+            if resume_epoch_idx != checkpoint_epoch_idx:
+                raise RuntimeError(
+                    "In-epoch checkpoint epoch does not match its checkpoint "
+                    f"metadata: progress={resume_epoch_idx}, "
+                    f"checkpoint={checkpoint_epoch_idx}."
+                )
+            if resume_epoch_idx >= self.num_epochs:
+                raise RuntimeError(
+                    "In-epoch checkpoint refers to an epoch outside the current "
+                    f"training run: epoch={resume_epoch_idx}, "
+                    f"num_epochs={self.num_epochs}."
+                )
+            first_epoch_idx = resume_epoch_idx
+        else:
+            first_epoch_idx = checkpoint_epoch_idx + 1
+
+        for epoch_idx in range(first_epoch_idx, self.num_epochs):
+            is_resumed_incomplete_epoch = (
+                resume_train_progress is not None
+                and epoch_idx == int(resume_train_progress["epoch_idx"])
+            )
+            if is_resumed_incomplete_epoch:
+                self._restore_train_batch_sampler_cache(
+                    train_dataloader,
+                    resume_train_progress["epoch_batch_sampler_cache"],
+                )
+            train_loss = self.epoch_train(
+                train_dataloader,
+                epoch_idx=epoch_idx,
+                resume_batch_idx=(
+                    int(resume_train_progress["next_batch_idx"])
+                    if is_resumed_incomplete_epoch
+                    else 0
+                ),
+                resume_epoch_losses=(
+                    resume_train_progress["epoch_losses"]
+                    if is_resumed_incomplete_epoch
+                    else None
+                ),
+            )
+            if is_resumed_incomplete_epoch:
+                self._pending_train_progress = None
+                resume_train_progress = None
             val_loss, metric_dict = 0.0, {}
             if val_dataloader is not None:
                 val_loss, metric_dict = self.epoch_validEval(val_dataloader, epoch_idx=epoch_idx)
@@ -1064,6 +1239,19 @@ class DRGVLM_PPTrainer:
                 if isinstance(metric_losses, list)
                 else None
             ),
+            "train_progress": (
+                {
+                    "epoch_idx": int(self._active_train_progress["epoch_idx"]),
+                    "next_batch_idx": int(
+                        self._active_train_progress["next_batch_idx"]
+                    ),
+                    "epoch_loss_count": len(
+                        self._active_train_progress["epoch_losses"]
+                    ),
+                }
+                if self._active_train_progress is not None
+                else None
+            ),
         }
         encoded = json.dumps(
             serializable,
@@ -1104,6 +1292,7 @@ class DRGVLM_PPTrainer:
             ),
             "rng_state": self._capture_rng_state(),
             "train_dataloader_generator_state": train_generator_state,
+            "train_progress": self._active_train_progress,
             "resume_signature": self.current_resume_signature,
         }
 
@@ -1341,6 +1530,7 @@ class DRGVLM_PPTrainer:
 
         loaded_epoch_idx = int(checkpoint.get("epoch_idx", -1))
         self.checkpoint_epoch_idx = loaded_epoch_idx if self.trainer_mode != "reTrain" else -1
+        train_progress = checkpoint.get("train_progress")
 
         if self.trainer_mode == "reTrain":
             # Optimizer and scheduler were freshly initialized in from_config;
@@ -1388,6 +1578,49 @@ class DRGVLM_PPTrainer:
             self._pending_train_generator_state = checkpoint.get(
                 "train_dataloader_generator_state"
             )
+            self._pending_train_progress = None
+            if train_progress is not None:
+                if not isinstance(train_progress, dict):
+                    raise RuntimeError(
+                        "Checkpoint train_progress must be a dictionary."
+                    )
+                required_progress_keys = {
+                    "epoch_idx",
+                    "next_batch_idx",
+                    "epoch_losses",
+                    "epoch_start_train_generator_state",
+                    "epoch_batch_sampler_cache",
+                }
+                missing_progress_keys = sorted(
+                    required_progress_keys - set(train_progress)
+                )
+                if missing_progress_keys:
+                    raise RuntimeError(
+                        "In-epoch checkpoint is missing train_progress fields: "
+                        + ", ".join(missing_progress_keys)
+                    )
+                if train_progress["epoch_start_train_generator_state"] is None:
+                    raise RuntimeError(
+                        "In-epoch checkpoint has no epoch-start DataLoader "
+                        "generator state, so exact continuation is unavailable."
+                    )
+                self._pending_train_progress = {
+                    "epoch_idx": int(train_progress["epoch_idx"]),
+                    "next_batch_idx": int(train_progress["next_batch_idx"]),
+                    "epoch_losses": [
+                        float(loss)
+                        for loss in train_progress["epoch_losses"]
+                    ],
+                    "epoch_start_train_generator_state": train_progress[
+                        "epoch_start_train_generator_state"
+                    ],
+                    "epoch_batch_sampler_cache": train_progress[
+                        "epoch_batch_sampler_cache"
+                    ],
+                }
+                self._pending_train_generator_state = self._pending_train_progress[
+                    "epoch_start_train_generator_state"
+                ]
             self._restore_rng_state(checkpoint.get("rng_state"))
             self._migrate_clinical_metric_state(
                 checkpoint_dir=checkpoint_root,
@@ -1605,6 +1838,11 @@ class DRGVLM_PPTrainer:
             amp=cfg.amp,
             accumulation_steps=cfg.accumulation_steps,
             max_new_tokens=getattr(cfg, "max_new_tokens", 256),
+            checkpoint_every_n_optimizer_steps=getattr(
+                cfg,
+                "checkpoint_every_n_optimizer_steps",
+                100,
+            ),
         )
 
         cfg.total_steps = math.ceil(
@@ -1661,7 +1899,6 @@ class DRGVLM_PPTrainer:
             trainer.load_checkpoint(path=checkpoint_path)
 
         return trainer
-
 
 
 

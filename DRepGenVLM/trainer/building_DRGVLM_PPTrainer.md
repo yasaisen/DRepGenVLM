@@ -22,14 +22,16 @@
 
 | 屬性 | 語義 |
 | --- | --- |
-| `checkpoint_epoch_idx` | 已載入 checkpoint 完成的 epoch；新訓練為 `None` |
+| `checkpoint_epoch_idx` | 已載入 checkpoint 的 epoch；若附帶 in-epoch progress，該 epoch 尚未完成；新訓練為 `None` |
 | `global_step` | 已處理的 DataLoader batch 數，不是 optimizer update 數 |
 | `optimizer_step` | 實際完成的 optimizer update 數 |
+| `checkpoint_every_n_optimizer_steps` | 每 N 次 optimizer update 寫入一次 in-epoch `latest` checkpoint；`0` 表示關閉 |
 | `best_val_loss` | 歷史最低 validation loss |
 | `best_metric_values` | 各 metric-best checkpoint 的 score、epoch 與相關狀態 |
 | `patience_counter` | validation loss 未改善的連續 epoch 數 |
 | `resume_num_batches_per_epoch` | checkpoint 保存的 epoch batch 數 |
 | `_pending_train_generator_state` | 等 DataLoader 建立後才恢復的 generator state |
+| `_pending_train_progress` | 已載入的未完成 epoch 之 batch 位置、loss history 與 epoch-start sampling state |
 | `_snapshot_cache_key/path` | 同一訓練狀態重複更新多個 reference 時重用 snapshot |
 
 `device="cuda"` 會正規化為 `"cuda:0"`。
@@ -350,6 +352,8 @@ shared cache 關閉時回傳 `None`。
    - `optimizer_step += 1`。
    - 清空 gradients。
 7. 每個 DataLoader batch 都寫入 train loss metrics；learning rate 只在真正 optimizer update 時記錄。
+8. 預設每 100 次 optimizer update，在非 epoch 最後一個 batch 的 accumulation boundary 建立 `latest_model.pth` checkpoint。可由 `checkpoint_every_n_optimizer_steps` 覆寫；設為 `0` 關閉。
+9. in-epoch checkpoint 只在 gradients 已套用、scheduler 已前進且 gradients 已清空後建立，因此不保存半個 accumulation block。
 
 epoch 回傳：
 
@@ -539,6 +543,7 @@ schema version 2 保存：
 - metrics train loss history。
 - Python、NumPy、Torch CPU 與所有 CUDA RNG states。
 - train DataLoader generator state。
+- 可選的 `train_progress`：未完成 epoch 的 next batch index、該 epoch 已記錄的 logging losses、epoch-start DataLoader generator state，以及 `MaxROIBatchSampler` 的 cached batch plan。
 - resume signature。
 
 LoRA adapter 另存於 `adapter/`，不嵌入 trainer state。
@@ -579,6 +584,7 @@ cache key 包含：
 - best metric states。
 - patience。
 - metrics loss record 數。
+- 是否含 in-epoch progress（epoch、next batch 與 epoch loss 數）。
 
 它的目的只是在同一狀態下讓多個 reference 指向同一 snapshot。
 
@@ -693,6 +699,12 @@ DataLoader generator state 在 `load_checkpoint` 時先暫存，等 `train_datal
 
 若 checkpoint 有 generator state、目前 DataLoader 卻沒有 explicit generator，必須失敗。
 
+### 21.1 In-epoch continuation
+
+in-epoch `latest` checkpoint 另保存該 epoch 起點的 generator state。keepTrain 載入時會先恢復這個起點狀態，再重建相同的 DataLoader iteration，跳過已處理 batches，從 checkpoint 的 next batch 繼續。
+
+對 `MaxROIBatchSampler`，`len(dataloader)` 會 materialize cached batch plan；checkpoint 因此也保存並恢復該 plan，避免重新取樣造成 batch ordering 改變。只有 checkpoint 在 accumulation boundary 建立，故恢復時不會遺失 in-flight gradients。
+
 這些機制共同維持 sampler order、worker seeds、augmentation 與 train `random_k` 的 continuation。
 
 ## 22. `keepTrain` 與 `reTrain`
@@ -704,7 +716,7 @@ DataLoader generator state 在 `load_checkpoint` 時先暫存，等 `train_datal
 - LoRA adapter。
 - optimizer state。
 - scheduler state。
-- completed epoch。
+- checkpoint epoch；若含 `train_progress`，從該 epoch 未完成的下一個 batch 繼續，否則從下一個 epoch 開始。
 - global step 與 optimizer step。
 - best validation loss。
 - best metric states。
@@ -802,6 +814,7 @@ clinical checkpoint 必須有 `clinical_metric_schema_version`。不同 schema v
 13. resume 不得在完成新 epoch 前改寫歷史 best/latest。
 14. clinical scores 不得跨 metric schema version 直接比較。
 15. 保存 checkpoint 前必須檢查 parameters 與 optimizer state finite。
+16. in-epoch checkpoint 必須只在 completed optimizer update 的 accumulation boundary 建立，且 keepTrain 必須重播相同 sampling order 後跳過已完成 batches。
 
 ## 26. 現行邊界與非保證項目
 
