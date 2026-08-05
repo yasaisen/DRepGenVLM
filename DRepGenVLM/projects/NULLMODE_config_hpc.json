@@ -1,7 +1,7 @@
 {
   "project_name": "NULLMODE",
   "is_HPC": true,
-  "factory_timestamp": "2607310447",
+  "factory_timestamp": "2608051356",
   "localGPU_image_path": "/media/yasaisen/NAS8/for_research/datasets/WSI_fromNAS",
   "localGPU_metadata_path": "/media/yasaisen/NAS8/for_research/metadatas",
   "localGPU_weight_path": "/media/yasaisen/NAS8/for_research/weights",
@@ -52,7 +52,8 @@
   "trainer_mode": null,
   "accumulation_steps": 8,
   "weight_filename": "best_model.pth",
-  "save_freq": 5,
+  "save_freq": 1,
+  "checkpoint_every_n_optimizer_steps": 100,
   "plot_freq": 5,
   "gradient_clip_norm": 1.0,
   "amp": true,
