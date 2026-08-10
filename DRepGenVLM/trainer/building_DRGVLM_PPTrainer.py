@@ -1194,7 +1194,15 @@ class DRGVLM_PPTrainer:
             return
         random.setstate(state["python"])
         np.random.set_state(state["numpy"])
-        torch.set_rng_state(state["torch_cpu"])
+        torch_cpu_state = state["torch_cpu"]
+        if (
+            not isinstance(torch_cpu_state, torch.Tensor)
+            or torch_cpu_state.dtype != torch.uint8
+        ):
+            raise TypeError(
+                "Checkpoint torch_cpu RNG state must be a torch.ByteTensor."
+            )
+        torch.set_rng_state(torch_cpu_state.cpu())
         saved_cuda = state.get("torch_cuda")
         if saved_cuda is not None:
             if not torch.cuda.is_available():
@@ -1207,7 +1215,18 @@ class DRGVLM_PPTrainer:
                     "CUDA topology changed during keepTrain resume: "
                     f"checkpoint GPUs={len(saved_cuda)}, current GPUs={current_count}."
                 )
-            torch.cuda.set_rng_state_all(saved_cuda)
+            cpu_cuda_states = []
+            for device_idx, cuda_state in enumerate(saved_cuda):
+                if (
+                    not isinstance(cuda_state, torch.Tensor)
+                    or cuda_state.dtype != torch.uint8
+                ):
+                    raise TypeError(
+                        "Checkpoint CUDA RNG state for device "
+                        f"{device_idx} must be a torch.ByteTensor."
+                    )
+                cpu_cuda_states.append(cuda_state.cpu())
+            torch.cuda.set_rng_state_all(cpu_cuda_states)
 
     def _reference_name(self, weight_filename: str) -> str:
         stem = os.path.splitext(os.path.basename(weight_filename))[0]
@@ -1521,9 +1540,12 @@ class DRGVLM_PPTrainer:
             self._resolve_checkpoint_artifacts(path)
         )
         self.resume_checkpoint_root = checkpoint_root
+        # RNG and DataLoader generator states are CPU-only ByteTensors.  Load
+        # the checkpoint on CPU and let Optimizer.load_state_dict move its
+        # parameter states to the corresponding parameter devices.
         checkpoint = torch.load(
             trainer_path,
-            map_location=self.device,
+            map_location="cpu",
             weights_only=False,
         )
         self.get_model_raw().load_lora_weights(path=lora_dir)

@@ -25,4 +25,5 @@ echo "Num GPUs: $SLURM_GPUS_PER_NODE"
 source /home/misaka13/anaconda3/etc/profile.d/conda.sh
 conda activate MVLM_CLEE
 
-python /home/misaka13/R27_MVLM_v3.18.5/DRepGenVLM/R27_MVLM_trainDRGVLM_v0.0.py --cfg-path /home/misaka13/R27_MVLM_v3.18.5/DRepGenVLM/DRepGenVLM/projects/MG15_basic_R145_PP4G_config_hpc.json
+# python /home/misaka13/R27_MVLM_v3.18.5/DRepGenVLM/R27_MVLM_trainDRGVLM_v0.0.py --cfg-path /home/misaka13/R27_MVLM_v3.18.5/DRepGenVLM/DRepGenVLM/projects/MG15_basic_R145_PP4G_config_hpc.json
+python /home/misaka13/R27_MVLM_v3.18.5/DRepGenVLM/R27_MVLM_trainDRGVLM_v0.0.py --latest-checkpoint-path /work/misaka13/R27_MVLM_v3.19/checkpoints/260805140136 --use-this-dir
